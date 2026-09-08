@@ -16,7 +16,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/parthrsharma/forge/internal/pool"
+	"github.com/parth-sharma-10/forge/internal/pool"
 )
 
 func main() {
