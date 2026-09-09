@@ -197,3 +197,133 @@ are clean.
 **Lesson.** An assertion about "how many" is usually an assertion about timing
 wearing a disguise. Prefer a fact the code under test either exposes or hides —
 presence or absence — over a count of things the test itself spawned.
+
+---
+
+## 2026-09-09 — The cgroup tests passed while leaking a cgroup per test
+
+**Problem.** The first full run of the cgroups v2 suite was green. Three tests
+took 1.04s each while doing nothing that should take a second.
+
+**Symptoms.** 1.04s is not a number a test arrives at by accident — it is
+exactly the ceiling of `Group.remove`'s retry loop, 100 attempts at 10ms. So
+every one of those tests was failing to remove its cgroup, retrying for a full
+second, giving up, and returning an error that `defer g.Close()` discarded.
+`findmnt`'s equivalent for cgroups confirmed it:
+
+```
+/sys/fs/cgroup/forge-test-67099/job-2905759006
+/sys/fs/cgroup/forge-test-67099/job-252913528
+/sys/fs/cgroup/forge-test-67099/job-2110793459
+/sys/fs/cgroup/forge-test-67099/job-701056961
+```
+
+Four cgroups the suite created and never removed, on a green run.
+
+**Root cause.** Two, one in the tests and one in the code they were testing.
+
+1. `defer g.Close()` throws away the only signal that cleanup failed. Every
+   test did it, so no test could see a leak.
+2. `prepareRoot` created its root directory and then, if the controller check
+   failed, returned the error and left the directory behind. That orphan then
+   made *its own parent* un-removable, which is what the retry loop was
+   grinding against in `TestCreateRejectsAnUndelegatedRoot`.
+
+The test-side ordering bug was mine too: `defer g.Close()` runs before
+`t.Cleanup`, so the processes a test started were still alive — and still
+members of the cgroup — when it tried to remove it.
+
+**Fix.** `closeGroup(t, g)` fails the test if removal fails; `prepareRoot`
+removes a root it created but could not configure, and never touches one it was
+handed; the started processes are stopped by a `defer` registered *after* the
+close, so LIFO order kills them first. The 1.04s tests are now 0.02s to 0.26s —
+the timing was the tell, and it went away when the cause did.
+
+**Lesson.** A cleanup function whose error is discarded is not cleanup, it is a
+comment. The leak was not subtle and not rare — it happened on every run — and
+it was invisible purely because nothing asserted on it. Where the failure mode
+is "the resource is still there afterwards", the test has to look afterwards.
+
+---
+
+## 2026-09-09 — Mutation testing lied twice: stale binaries, then recycled pids
+
+**Problem.** The mutation batch over the cgroup code reported different results
+on identical consecutive runs — 3 gaps, then 2 different gaps, then 2 others.
+A mutation-testing harness that is not reproducible is worth nothing.
+
+**Symptoms.** Run to run, `controllers never enabled on the root`,
+`prepareRoot leaks a root it failed to configure` and `no EBUSY retry` each
+flipped between caught and missed. Meanwhile every one of them, run on its own,
+was caught.
+
+**Root cause.** Two independent defects, both of them "the harness measured
+something other than the mutation".
+
+1. **Stale binaries.** Four of the mutations did not compile — deleting a line
+   left a variable or an import unused. The harness ignored the build's exit
+   status, so the *previous* mutation's binary ran instead, and whatever it
+   reported was attributed to the current mutation. This is the same trap as
+   the Week 2 mount leak, rebuilt from scratch one week later.
+2. **Recycled pids.** The test roots were named `forge-test-<pid>`. One
+   mutation's whole purpose is to leak cgroups, so it leaves roots behind — and
+   a leftover root arrives with `cgroup.subtree_control` already set to
+   `cpu memory pids`. When a later run's pid collided with one of those, the
+   mutation that removes controller-enabling had nothing left to break, because
+   a previous run had already enabled them. Nine such roots were on the VM,
+   every one pre-configured.
+
+**Investigation.** The decisive step was logging each mutation's test output
+separately instead of overwriting one file, then reading the two that passed.
+`TestCreateWritesLimits` passing under "controllers never enabled" said
+`memory.max` existed in a child of a root we had definitely not configured,
+which only a pre-configured root explains. Listing the leftovers and their
+`subtree_control` confirmed it in one command. Before that, four rounds of
+reasoning about cgroup semantics had produced nothing but plausible stories.
+
+**Fix.** The harness aborts a case with `BUILD-FAIL` rather than reporting a
+result when the mutation does not compile, and every mutation was rewritten to
+compile (`n > 0` becomes `n < 0`; `attempts = 100` becomes `attempts = 1`).
+Test roots come from `os.MkdirTemp`, which cannot collide with anything. The
+VM was rebooted to clear the accumulated debris before the verifying run.
+8 of 8 mutations are now caught, twice in a row, and the suite passes 27/27
+three times running.
+
+**Lesson.** Test isolation has to hold against the tests that are *supposed* to
+break things. Per-test cleanup could never have saved this: one mutation's
+entire purpose was to defeat cleanup, and the residue it left was a valid
+configuration that the next experiment silently inherited. Name anything shared
+by construction-unique means (`MkdirTemp`), not by something that recycles.
+And a harness that reports pass/fail without checking that the thing it built
+is the thing it ran is measuring its own history.
+
+---
+
+## 2026-09-09 — An OOM test that took 0.98s or 14.8s depending on the day
+
+**Problem.** `TestMemoryLimitIsReportedAsAnOOMKill` and
+`TestCgroupIsRemovedAfterAnOOMKill` run the same workload against a 16MiB cap.
+Across two runs they took 7.15s and 0.35s, then 0.98s and 14.82s.
+
+**Root cause.** The workload grew memory by reading a large stream into a shell
+variable, `x=$(yes forge | head -c 134217728)`. `memory.max` charges page cache
+to the same cgroup as anonymous memory, so with the cap that tight the kernel
+reclaimed the only file-backed pages available to it — busybox's own text pages,
+read from the bind-mounted rootfs — and then faulted them straight back in. The
+job spent its life thrashing, and how long that took depended on the host's disk
+and cache state rather than on anything the test controls.
+
+**Investigation.** Timed both candidate workloads directly, three runs each,
+before changing the test: the pipe took 653–846ms with 30% spread, while
+doubling a shell variable (`x=$x$x` in a loop) took 166–195ms with 8%. Pure
+anonymous memory, no reads, nothing for the kernel to reclaim except the
+allocation itself.
+
+**Fix.** Both tests use the doubling workload. Steady state is 0.14–0.19s; the
+first run after a rebuild is ~3s, which is the rootfs coming back into cache.
+The 15-second tail is gone.
+
+**Lesson.** Under a memory cgroup, "allocate a lot" and "allocate a lot of
+*anonymous* memory" are different experiments. Anything the job reads is
+charged to the same limit and is reclaimable, so a file-backed workload measures
+the kernel's reclaim heuristics and the disk, not the limit.
