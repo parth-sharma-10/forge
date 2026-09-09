@@ -364,3 +364,74 @@ depend on statement order in every caller, forever. And the skip hazard noted in
 `decisions.md` has a second face: skips make an unprivileged run green, so the
 only signal that an unprivileged run is even *possible* comes from a machine
 that runs both.
+
+---
+
+## 2026-09-09 — The missing /dev was silently writing into the shared rootfs
+
+**Problem.** The known symptom was that `sh` prints `can't open '/dev/null'`
+for every backgrounded job, because the Alpine image ships an empty `dev/`.
+The symptom turned out to be the harmless half.
+
+**Symptoms.** A redirect *succeeded*:
+
+```
+$ sudo forged -rootfs /var/tmp/forge-rootfs -- /bin/sh -c 'echo hi > /dev/null; echo wrote ok'
+wrote ok
+$ ls -l /var/tmp/forge-rootfs/dev/
+-rw-r--r-- 1 root root 3 Sep  9 21:30 null
+```
+
+**Root cause.** With no `/dev` mounted, `dev/` is an ordinary writable
+directory in the rootfs image. A shell redirect creates a regular file there.
+The rootfs is bind-mounted, not copied, so that file is not scoped to the
+build: it is in the image every subsequent build on this worker starts from,
+growing by whatever each of them writes.
+
+Anything *reading* a device fails outright (`dd: can't open '/dev/urandom'`),
+so the failure mode is split: reads fail loudly, writes succeed and
+contaminate.
+
+**Fix.** A tmpfs on `/dev` inside the sandbox's mount namespace, with the six
+standard nodes created on it. See `decisions.md` for why not a host bind mount.
+
+**Lesson.** "The build errors out" was the reported symptom, and it framed the
+whole thing as a usability gap. Reproducing each affected operation separately
+— read, write, background — was what turned up the one that does not error. A
+missing thing that fails loudly is a bug; a missing thing that succeeds wrongly
+is a bug that spreads.
+
+---
+
+## 2026-09-09 — A cleanup test that made every later run fail
+
+**Problem.** The new test asserting the rootfs image stays clean caught its own
+mutations, and also caught mutations that had nothing to do with it — the
+`umask` one, the wrong-minor one. Nine out of nine, for the wrong reason.
+
+**Symptoms.** In the first mutation batch `TestDevDoesNotOutliveTheSandbox`
+failed for all nine mutations. `no-tmpfs-just-nodes` additionally failed
+sixteen unrelated tests, including `TestCommandRunsAsPIDOne`.
+
+**Root cause.** Two mutations make a build write into the shared rootfs image.
+The test detected that and failed — and left the file there. Every later
+mutation in the batch then started from a dirty image and failed the same
+assertion. The sixteen-test cascade is the same contamination one step on: a
+leftover `dev/null` makes the *next* run's `mknod` fail with `EEXIST`, so the
+sandbox never builds and every test in the suite fails at once.
+
+**Fix.** The assertion clears the directory as it reads it, before and after
+the run, and reports what it removed. The second batch then pins each mutation
+to a specific test: `umask-not-zeroed` fails exactly
+`TestDevNodesAreWritableByAnyone`, `full-has-nulls-minor` fails exactly
+`TestDevNodesBehaveLikeTheirKernelDevices`.
+
+**Lesson.** This is the third time in two weeks that a green mutation score was
+the thing that needed checking rather than the thing that ended the check
+(stale binaries, recycled pids, now shared host state). The tell is the same
+every time: *which* test caught each mutation, not how many were caught. 9/9
+and 9/9 look identical until the failing test names are read, and one of them
+is a harness reporting on its own debris.
+
+A test that asserts external state is clean has to leave it clean when it
+fails. Otherwise its first failure is the only honest one.

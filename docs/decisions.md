@@ -221,6 +221,48 @@ the colima VM — the default is a cgroup of Forge's own directly under the root
 not delegate it, rather than failing later and less legibly on a missing
 `memory.max`.
 
+## 2026-09-09 — /dev is a private tmpfs with six nodes made from their numbers
+
+The sandbox needed a `/dev`. Three ways to get one:
+
+1. **Bind-mount the host's `/dev`.** What most quick fixes do. It hands the
+   build `/dev/mem`, `/dev/kmsg` and every block device on the machine. A
+   sandbox that can open `/dev/sda` is not a sandbox.
+2. **Ship the nodes in the rootfs image.** No mount needed, but the image is
+   shared by every build on the worker and is writable, so the nodes are
+   shared mutable state — and a build that deletes `/dev/null` breaks the next
+   build rather than itself.
+3. **A tmpfs mounted inside the sandbox's own mount namespace, with the nodes
+   created on it by `mknod`.** Chosen.
+
+The tmpfs makes the device set a property of the code rather than of the host
+or the image: exactly the six nodes listed in `devNodes` exist, made from the
+major and minor numbers in the kernel's own device registry, and the host's
+`/dev` is never read. It also disappears with the mount namespace, so there is
+no cleanup path to get wrong.
+
+Two details that are not incidental:
+
+- **The mount is not `MS_NODEV`.** That flag makes device nodes on a filesystem
+  inert, and carrying six of them is this filesystem's entire purpose. It is
+  `nosuid,noexec`, which costs nothing here.
+- **The umask is zeroed around the `mknod` calls.** `mknod` masks its mode the
+  way `open` does, so an inherited 022 leaves `/dev/null` at 0644 — which works
+  for exactly as long as every build runs as root, i.e. until the user
+  namespace lands, and then fails as a permission error a long way from its
+  cause.
+
+Not included: `/dev/shm`, `/dev/ptmx` and a `devpts` mount. Nothing needs them
+until a build wants a pty or POSIX shared memory, and each is another mount to
+justify. `/dev/tty` is included as a node — opening it with no controlling
+terminal gives `ENXIO`, which is what a tool probing for a tty expects; its
+absence gives `ENOENT`, which some read as "broken system" rather than "no tty".
+
+**This does not narrow the threat model.** A build still runs as real root with
+`CAP_MKNOD`, so a hostile one can `mknod` its own `/dev/sda` anywhere it can
+write. Bounding that is the user namespace's job, not this change's; what this
+change fixes is builds failing by accident.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that

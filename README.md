@@ -6,9 +6,9 @@ sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
 **Status: Phase 0, Week 3 of 5 phases.** What exists today is the bounded worker
-pool, the sandbox's namespace isolation, and per-job cgroups v2 resource limits.
-The API, the queue and everything distributed are not built yet. This README will not claim
-otherwise; see [docs/architecture.md](docs/architecture.md) for what is
+pool, the sandbox's namespace isolation and private device filesystem, and
+per-job cgroups v2 resource limits. The API, the queue and everything
+distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented and [docs/decisions.md](docs/decisions.md) for why.
 
 ## Quickstart
@@ -80,6 +80,32 @@ rather than guessing from the status. `-cpu` throttles instead of killing;
 `-pids` makes the offending `fork` fail (`can't fork: Resource temporarily
 unavailable`) rather than letting a runaway `make -j` take the worker down.
 
+### Devices
+
+The sandbox gets a `/dev` of its own — a tmpfs holding six character devices
+and four symlinks, made from the kernel's device numbers rather than copied
+from the host, so a build cannot reach `/dev/sda` or `/dev/mem` through it.
+
+```
+$ sudo /tmp/forged -rootfs /var/tmp/forge-rootfs -- /bin/sh -c 'ls /dev; sleep 0 & wait; echo ok'
+fd
+full
+null
+random
+stderr
+stdin
+stdout
+tty
+urandom
+zero
+ok
+```
+
+Without it, `sh` printed `can't open '/dev/null'` for every backgrounded job,
+`dd if=/dev/urandom` failed outright — and, worse, `echo hi > /dev/null`
+*succeeded*, leaving a regular file called `null` in the rootfs image that
+every later build on the worker inherited.
+
 ### The worker pool
 
 `forge-worker` is currently a driver for the pool. Press `Ctrl-C` once and it
@@ -104,7 +130,7 @@ cmd/forge-api      HTTP API                      (not built yet)
 cmd/forge-worker   job executor                  (pool driver today)
 cmd/forged         sandbox runtime               implemented
 internal/pool      bounded worker pool           implemented
-internal/sandbox   namespaces, pivot_root        implemented
+internal/sandbox   namespaces, pivot_root, /dev  implemented
                    seccomp                       (not built yet)
 internal/cgroup    cgroups v2 memory/cpu/pids    implemented
 internal/queue     PostgreSQL queue, leases      (not built yet)
@@ -127,10 +153,11 @@ The sandbox isolates against *accident*, not against a hostile build. There is
 no user namespace yet, so root inside the sandbox is root on the host, and no
 seccomp filter, so the full syscall surface is reachable.
 
-There is also still no `/dev`, which is more disruptive than it sounds: `sh`
-opens `/dev/null` for every backgrounded job, so a build script containing `&`
-prints `can't open '/dev/null'` for each one. A tmpfs `/dev` with the standard
-nodes is the next thing the sandbox needs to run real builds.
+The `/dev` the sandbox provides is six nodes and four symlinks, and nothing
+else. A build that wants a pty or POSIX shared memory (`/dev/ptmx`,
+`/dev/shm`) does not get one yet. Making device nodes is also not blocked —
+sandbox root has `CAP_MKNOD` — so the private `/dev` keeps builds working, it
+does not contain a hostile one; that is the user namespace's job.
 
 There is also still no API, no persistence, and no benchmark numbers — and none
 will be quoted here until a harness produces them.

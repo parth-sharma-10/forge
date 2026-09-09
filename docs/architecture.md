@@ -1,7 +1,8 @@
 # Forge — architecture
 
 Status: **Phase 0, Week 3.** The bounded worker pool, the sandbox's namespace
-isolation, and per-job cgroups v2 resource limits exist. This document describes the target shape and is
+isolation with a private device filesystem, and per-job cgroups v2 resource
+limits exist. This document describes the target shape and is
 updated as each milestone lands; anything not marked *implemented* is not built
 yet.
 
@@ -81,6 +82,7 @@ forge-worker (or forged, or the test binary)
      |  pivot_root(rootfs, .forge-oldroot)
      |  umount2(old, MNT_DETACH); rmdir  no mount left to walk back to
      |  mount(proc, /proc)               the new PID namespace's process table
+     |  mount(tmpfs, /dev) + mknod x6    six devices, and nothing else
      v
 execve(build command)                    PID 1 of its own namespace
 ```
@@ -101,9 +103,25 @@ a worker that dies mid-build does not leave the build running.
 Exit status 125 distinguishes "the sandbox could not be built" from the build
 command's own status, which is otherwise passed through untouched.
 
+**A private `/dev`.** The sandbox mounts a tmpfs on `/dev` and creates six
+character devices on it — `null`, `zero`, `full`, `random`, `urandom`, `tty` —
+plus `fd`, `stdin`, `stdout` and `stderr` as symlinks into its own `/proc`. The
+host's `/dev` is never consulted: the nodes are made from the major and minor
+numbers in the kernel's device registry, so the set is exactly what the code
+lists and nothing depends on what the host happens to have.
+
+The tmpfs is what makes it correct rather than merely present. The rootfs is
+bind-mounted and shared by every build on the worker, so without a mount over
+it, `dev/` is a writable directory in that shared image: a build redirecting to
+`/dev/null` creates a *file* of that name, which the next build inherits.
+Reads (`/dev/urandom`) failed loudly; writes succeeded and contaminated. With
+the tmpfs, both are correct and neither outlives the mount namespace, so there
+is no cleanup path to get wrong.
+
 **Not isolated yet**, and named as such in the README rather than implied away:
-no user namespace (sandbox root *is* host root), no seccomp filter, no `/dev`,
-and no network interface at all. Resource limits landed in Week 3; the rest is
+no user namespace (sandbox root *is* host root, and keeps `CAP_MKNOD`, so a
+hostile build can still make its own device nodes), no seccomp filter, and no
+network interface at all. Resource limits landed in Week 3; the rest is
 Phase 1.
 
 Tests live behind `//go:build linux` and need `CAP_SYS_ADMIN` plus an unpacked
@@ -162,6 +180,7 @@ adaptation. The default is `/sys/fs/cgroup/forge`.
 
 Phase 0 Week 4 — seccomp: a syscall filter applied after the sandbox is built
 and before the build command is exec'd, denying by default rather than listing
-what to block. Then the user namespace that makes sandbox root stop being host
+what to block. It is also what would bound `mknod`, which the private `/dev`
+deliberately does not. Then the user namespace that makes sandbox root stop being host
 root, which is the change that turns this from a boundary against accident into
 one against a hostile build.
