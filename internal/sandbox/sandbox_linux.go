@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+
+	"github.com/parth-sharma-10/forge/internal/cgroup"
 )
 
 // namespaces is the isolation applied at clone time. All five are unshared in
@@ -43,6 +45,12 @@ func Run(ctx context.Context, spec Spec) error {
 		return err
 	}
 
+	group, err := cgroup.Create(spec.CgroupRoot, spec.Limits)
+	if err != nil {
+		return err
+	}
+	defer group.Close()
+
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", append([]string{ChildArg}, spec.Args...)...)
 	cmd.Env = []string{
 		envRootfs + "=" + spec.Rootfs,
@@ -54,12 +62,29 @@ func Run(ctx context.Context, spec Spec) error {
 		// A worker that dies mid-build must not leave the build running: the
 		// sandbox has no supervisor of its own to notice.
 		Pdeathsig: syscall.SIGKILL,
+		// The kernel puts the child in the cgroup as part of the clone, so the
+		// limits are in force before the child's first instruction. Setting
+		// them by writing cgroup.procs after Start would leave a window in
+		// which the build runs uncapped.
+		UseCgroupFD: true,
+		CgroupFD:    group.FD(),
 	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("sandbox: start child (needs CAP_SYS_ADMIN — run as root): %w", err)
 	}
-	return cmd.Wait()
+	runErr := cmd.Wait()
+
+	// Asked after the wait and before Close removes the cgroup: this is the
+	// only moment the counter is both final and still readable.
+	if runErr != nil {
+		if oom, err := group.OOMKilled(); err != nil {
+			return fmt.Errorf("%w (could not check for an OOM kill: %w)", runErr, err)
+		} else if oom {
+			return fmt.Errorf("%w: %w", ErrOOMKilled, runErr)
+		}
+	}
+	return runErr
 }
 
 // MaybeChild applies the sandbox to this process and execs the build command
