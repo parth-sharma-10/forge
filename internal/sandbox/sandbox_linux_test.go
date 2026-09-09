@@ -213,6 +213,130 @@ func TestMountsDoNotLeakToHost(t *testing.T) {
 	}
 }
 
+// devScript exercises each node by what it does rather than by its major and
+// minor numbers: a node made from the wrong pair still passes an `ls -l`
+// assertion on the numbers this test would have hard-coded, but /dev/full does
+// not refuse a write unless it really is 1:7.
+const devScript = `
+for n in null zero full random urandom tty; do [ -c /dev/$n ] || echo "MISSING $n"; done
+echo discarded > /dev/null
+[ -s /dev/null ] && echo null-is-a-file || echo null-discards
+dd if=/dev/zero bs=4 count=1 2>/dev/null | wc -c
+dd if=/dev/urandom bs=16 count=1 2>/dev/null | wc -c
+echo x > /dev/full 2>/dev/null && echo full-accepted || echo full-refused
+echo piped | cat /dev/stdin
+ls /dev/fd > /dev/null && echo fd-ok
+`
+
+func TestDevNodesBehaveLikeTheirKernelDevices(t *testing.T) {
+	out, err := sh(t, devScript)
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := "null-discards\n4\n16\nfull-refused\npiped\nfd-ok"
+	if out != want {
+		t.Fatalf("got:\n%s\n\nwant:\n%s", out, want)
+	}
+}
+
+// TestDevNodesAreWritableByAnyone is the assertion behind zeroing the umask
+// before mknod. Without it the inherited 022 leaves /dev/null at 0644, which
+// works for exactly as long as every build runs as root — that is, until the
+// user namespace lands and the failure looks like something else entirely.
+func TestDevNodesAreWritableByAnyone(t *testing.T) {
+	out, err := sh(t, "ls -l /dev/null | cut -c1-10")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "crw-rw-rw-" {
+		t.Fatalf("/dev/null mode = %q, want crw-rw-rw-", out)
+	}
+}
+
+// TestABackgroundJobPrintsNothing is the symptom that sent us here: sh opens
+// /dev/null for every job it backgrounds, so before there was a /dev, any
+// build script containing `&` printed an error per `&`.
+func TestABackgroundJobPrintsNothing(t *testing.T) {
+	out, err := sh(t, "sleep 0 & wait; echo done")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "done" {
+		t.Fatalf("output = %q, want just \"done\": backgrounding a job still writes to stderr", out)
+	}
+}
+
+// TestDevIsOnlyTheMinimalSet fails if anyone ever "fixes" a missing device by
+// bind-mounting the host's /dev in. A sandbox that can open /dev/sda or
+// /dev/mem has no boundary left worth the name.
+func TestDevIsOnlyTheMinimalSet(t *testing.T) {
+	out, err := sh(t, "ls -a /dev | sort | tr '\\n' ' '")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := ". .. fd full null random stderr stdin stdout tty urandom zero"
+	if out != want {
+		t.Fatalf("/dev = %q, want %q", out, want)
+	}
+}
+
+// TestDevDoesNotOutliveTheSandbox covers the cleanup path, which is the mount
+// namespace's rather than any code's: nothing unmounts /dev, so the test is
+// that nothing has to. It runs a build that is killed rather than one that
+// exits, since a clean exit is the case least likely to leave anything behind.
+func TestDevDoesNotOutliveTheSandbox(t *testing.T) {
+	dir := rootfs(t)
+	dev := filepath.Join(dir, "dev")
+	if dirt := emptyDir(t, dev); len(dirt) != 0 {
+		t.Logf("%s was not empty before the run (%v) — a manual run or a crash left it; cleared", dev, dirt)
+	}
+
+	spec := Spec{Rootfs: dir, Args: []string{"/bin/sh", "-c", "echo contaminated > /dev/null; sleep 60"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, spec) }()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sandbox outlived its cancelled context")
+	}
+
+	if mountedOnHost(t, dev) {
+		t.Fatalf("the sandbox's tmpfs on %s survived in the host mount namespace", dev)
+	}
+	// The whole reason /dev is a mount and not a set of files: the rootfs
+	// image is shared by every build on the worker, and a `> /dev/null` in one
+	// of them would otherwise leave a regular file behind for the next.
+	if leaked := emptyDir(t, dev); len(leaked) != 0 {
+		t.Fatalf("%s is not empty after the run (%v): the build wrote into the rootfs image", dev, leaked)
+	}
+}
+
+// emptyDir removes everything in dir and returns what it removed.
+//
+// The removal is the point, not a convenience. This assertion is about the
+// rootfs image being clean, and an assertion that leaves the image dirty when
+// it fails makes every later run in the same sandbox fail for a reason that
+// has nothing to do with the code under test — as one leftover /dev/null makes
+// the next run's mknod fail with EEXIST, taking the whole suite with it.
+func emptyDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			t.Errorf("clearing %s: %v", dir, err)
+		}
+	}
+	return names
+}
+
 func TestExitStatusPropagates(t *testing.T) {
 	_, err := sh(t, "exit 7")
 	var exitErr *exec.ExitError
@@ -296,11 +420,10 @@ func TestMemoryLimitIsReportedAsAnOOMKill(t *testing.T) {
 		Rootfs:     rootfs(t),
 		CgroupRoot: testCgroupRoot(t),
 		Limits:     cgroup.Limits{MemoryBytes: 16 << 20},
-		// Doubling a shell variable, rather than reading a large stream into
-		// one: the sandbox has no /dev to read zeroes from, and a pipe-fed
-		// workload charges page cache to the same cgroup, so the kernel
-		// reclaims busybox's own pages and thrashes for seconds before it
-		// OOMs. Doubling is pure anonymous memory and reaches the cap in
+		// Doubling a shell variable, rather than reading /dev/zero into one:
+		// a pipe-fed workload charges page cache to the same cgroup, so the
+		// kernel reclaims busybox's own pages and thrashes for seconds before
+		// it OOMs. Doubling is pure anonymous memory and reaches the cap in
 		// about twenty iterations.
 		Args:   []string{"/bin/sh", "-c", memoryHog},
 		Stdout: &out,
