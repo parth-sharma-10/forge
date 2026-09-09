@@ -26,10 +26,21 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/parth-sharma-10/forge/internal/cgroup"
 )
 
 // ErrUnsupported is returned by Run on platforms without Linux namespaces.
 var ErrUnsupported = errors.New("sandbox: requires Linux")
+
+// ErrOOMKilled wraps the error from Run when the kernel killed the build for
+// exceeding Spec.Limits.MemoryBytes.
+//
+// An OOM kill reaches userspace as SIGKILL — exit status 137 through a shell —
+// which is the same thing an operator's `kill -9` and a lease timeout look
+// like. Only the cgroup knows the difference, so Run asks it. The returned
+// error still unwraps to *exec.ExitError for the status itself.
+var ErrOOMKilled = errors.New("sandbox: killed by the memory limit")
 
 // ChildArg is the argv[1] sentinel that marks a process as the re-executed
 // child stage. It is exported because a binary that dispatches on its own
@@ -70,6 +81,15 @@ type Spec struct {
 	// sandbox's PATH, inside the new root, not the host's.
 	Args []string
 
+	// Limits are the cgroups v2 resource caps. The zero value is no limits at
+	// all, which is what a build gets until a caller says otherwise.
+	Limits cgroup.Limits
+
+	// CgroupRoot is the parent cgroup that this job's cgroup is created under.
+	// Empty means cgroup.DefaultRoot; under systemd delegation, pass the
+	// delegated path.
+	CgroupRoot string
+
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
@@ -92,5 +112,5 @@ func (s *Spec) validate() error {
 	if s.Hostname == "" {
 		s.Hostname = defaultHostname
 	}
-	return nil
+	return s.Limits.Validate()
 }

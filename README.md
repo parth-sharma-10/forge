@@ -5,9 +5,9 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phase 0, Week 2 of 5 phases.** What exists today is the bounded worker
-pool and the sandbox's namespace isolation. The API, the queue, resource limits
-and everything distributed are not built yet. This README will not claim
+**Status: Phase 0, Week 3 of 5 phases.** What exists today is the bounded worker
+pool, the sandbox's namespace isolation, and per-job cgroups v2 resource limits.
+The API, the queue and everything distributed are not built yet. This README will not claim
 otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented and [docs/decisions.md](docs/decisions.md) for why.
 
@@ -52,6 +52,34 @@ sandbox: exec: "/bin/sh": stat /bin/sh: no such file or directory
 125 is reserved for the sandbox failing to build, so a scheduler can tell "this
 build fails" from "this worker cannot run builds".
 
+### Resource limits
+
+Each job gets its own cgroup, and the kernel puts the build in it at clone time
+— there is no window in which it runs uncapped. Limits are opt-in; the default
+is unlimited.
+
+```sh
+sudo /tmp/forged -rootfs /var/tmp/forge-rootfs \
+  -memory-mb 64 -cpu 0.5 -pids 32 -- /bin/sh -c 'echo built ok'
+```
+
+Exceeding the memory limit is reported as what it is, rather than left to look
+like every other SIGKILL:
+
+```
+$ sudo /tmp/forged -rootfs /var/tmp/forge-rootfs -memory-mb 16 \
+    -- /bin/sh -c 'x=aaaaaaaaaaaaaaaa; while :; do x=$x$x; done'
+sandbox: killed by the memory limit: signal: killed
+$ echo $?
+137
+```
+
+A lease timeout, an operator's `kill -9` and an OOM kill are all exit 137, and
+the scheduler's decision differs for each — so Forge reads `memory.events`
+rather than guessing from the status. `-cpu` throttles instead of killing;
+`-pids` makes the offending `fork` fail (`can't fork: Resource temporarily
+unavailable`) rather than letting a runaway `make -j` take the worker down.
+
 ### The worker pool
 
 `forge-worker` is currently a driver for the pool. Press `Ctrl-C` once and it
@@ -77,7 +105,8 @@ cmd/forge-worker   job executor                  (pool driver today)
 cmd/forged         sandbox runtime               implemented
 internal/pool      bounded worker pool           implemented
 internal/sandbox   namespaces, pivot_root        implemented
-                   cgroups, seccomp              (not built yet)
+                   seccomp                       (not built yet)
+internal/cgroup    cgroups v2 memory/cpu/pids    implemented
 internal/queue     PostgreSQL queue, leases      (not built yet)
 internal/cas       content-addressed storage     (not built yet)
 docs/              architecture, decisions, failures
@@ -87,17 +116,21 @@ docs/              architecture, decisions, failures
 
 Go 1.27+, and no third-party dependencies — `go.mod` has no `require` block.
 
-The sandbox needs a Linux kernel with cgroups v2 and `CAP_SYS_ADMIN`. Its
-package is behind `//go:build linux`; CI runs those tests on `ubuntu-latest`,
-and a macOS host runs them through `make vm-test` against a colima VM.
+The sandbox needs `CAP_SYS_ADMIN` and a Linux kernel with cgroups v2 and
+`CLONE_INTO_CGROUP` — 5.7 or newer. Those packages are behind `//go:build
+linux`; CI runs their tests on `ubuntu-latest`, and a macOS host runs them
+through `make vm-test` against a colima VM.
 
 ## Limitations
 
 The sandbox isolates against *accident*, not against a hostile build. There is
-no user namespace yet, so root inside the sandbox is root on the host; there are
-no cgroup limits, so a build can exhaust the machine's memory and CPU; there is
-no seccomp filter, so the full syscall surface is reachable; and there is no
-`/dev`, so a build that writes to `/dev/null` fails.
+no user namespace yet, so root inside the sandbox is root on the host, and no
+seccomp filter, so the full syscall surface is reachable.
+
+There is also still no `/dev`, which is more disruptive than it sounds: `sh`
+opens `/dev/null` for every backgrounded job, so a build script containing `&`
+prints `can't open '/dev/null'` for each one. A tmpfs `/dev` with the standard
+nodes is the next thing the sandbox needs to run real builds.
 
 There is also still no API, no persistence, and no benchmark numbers — and none
 will be quoted here until a harness produces them.

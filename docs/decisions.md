@@ -153,6 +153,74 @@ rootfs, which is a real hazard: an all-skipped run reports `PASS`. That is why
 in CI logs, and depends on the `rootfs` target rather than trusting the
 environment.
 
+## 2026-09-09 — The job is born in its cgroup, not moved into it
+
+`Run` sets `SysProcAttr.UseCgroupFD` with a descriptor for the job's cgroup, so
+the kernel places the process there as part of `clone3(CLONE_INTO_CGROUP)`.
+
+Rejected: the conventional sequence of starting the process and then writing its
+pid to `cgroup.procs`. Between those two steps the build is running with no
+limits at all. It is a small window, and a build that wants to allocate a few
+gigabytes before anyone stops it only needs a small window. Every workaround for
+it — a synchronisation pipe the child blocks on, a stopped process resumed after
+the write — is more code than not having the window.
+
+The cost is a hard floor of Linux 5.7 for `CLONE_INTO_CGROUP` and Go 1.22 for
+`UseCgroupFD`. Go does not silently fall back if `clone3` is unavailable; the
+call fails, which is the right direction for a security control to fail in.
+
+## 2026-09-09 — An OOM kill is read from the cgroup, not inferred from 137
+
+`Group.OOMKilled` reads `memory.events` after the job exits, and `Run` wraps the
+error with `ErrOOMKilled` when it says so.
+
+The exit status cannot answer the question. An OOM kill arrives as SIGKILL,
+which is also what a lease timeout, an operator's `kill -9`, and a parent's
+`Pdeathsig` look like. "Exit 137" is four different incidents wearing the same
+number, and the scheduler's decision differs for each: retry with more memory,
+retry as-is, do not retry, or drain the worker.
+
+`memory.events` has to be read after `wait4` and before the cgroup is removed —
+the only moment the counter is both final and still readable — which is why the
+lookup sits inline in `Run` rather than anywhere tidier.
+
+## 2026-09-09 — Every job gets a cgroup, including one with no limits
+
+`Limits{}` writes no interface files, but the cgroup is still created, entered
+and removed. `Run` therefore requires cgroups v2 even for an unlimited build.
+
+The alternative — skip the cgroup when no limits are set — adds a branch that
+makes every later question ("which cgroup did job X run in?", "what did it
+use?") conditional on how it was configured. Accounting that exists only
+sometimes is accounting nobody can build on. The cost is one `mkdir` and one
+`rmdir` per job, and a requirement the project already had.
+
+## 2026-09-09 — pids.max ships alongside memory and CPU
+
+The Week 3 plan named memory and CPU. `pids.max` is in the first cut too,
+because a fork bomb is not an exotic failure in a build sandbox — it is what a
+misconfigured `make -j` looks like from the kernel's side, and without a pid cap
+it takes the worker down with the build. It costs one line and one number.
+
+Memory and CPU are also the two limits whose *reporting* is interesting: memory
+kills and must be distinguished from other kills, CPU throttles silently. pids
+just fails the fork, which the build sees directly.
+
+## 2026-09-09 — The cgroup root is a parameter, defaulting to /sys/fs/cgroup/forge
+
+`Spec.CgroupRoot` names the parent that per-job cgroups are created under.
+
+Under systemd the worker is handed a delegated subtree (`Delegate=yes`) and is
+expected to stay inside it; systemd reconciles the parts of the tree it owns and
+will undo writes elsewhere. Passing the delegated path is then the entire
+adaptation, rather than a second code path. Outside systemd — the CI runner,
+the colima VM — the default is a cgroup of Forge's own directly under the root.
+
+`prepareRoot` enables `cpu`, `memory` and `pids` in the root's
+`cgroup.subtree_control`, and fails with the controller named if the parent did
+not delegate it, rather than failing later and less legibly on a missing
+`memory.max`.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that
