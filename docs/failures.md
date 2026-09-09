@@ -327,3 +327,40 @@ The 15-second tail is gone.
 *anonymous* memory" are different experiments. Anything the job reads is
 charged to the same limit and is reclaimable, so a file-backed workload measures
 the kernel's reclaim heuristics and the disk, not the limit.
+
+---
+
+## 2026-09-09 — A skip guard that three tests ran past
+
+**Problem.** CI failed on `make test`, the unprivileged run, with three
+`mkdir /sys/fs/cgroup/forge-sandbox-test-...: permission denied` failures.
+Every one of those tests passed locally, and the whole suite passed 27/27 three
+times in the VM.
+
+**Root cause.** `rootfs(t)` skips when the run is unprivileged or has no rootfs,
+and every sandbox test goes through it. But three of the cgroup tests need the
+root path before building the spec:
+
+```go
+root := testCgroupRoot(t)      // creates a cgroup directory
+out, err := runSpec(t, Spec{Rootfs: rootfs(t), CgroupRoot: root, ...})
+```
+
+`testCgroupRoot` runs first, and it was creating a directory under
+`/sys/fs/cgroup` before anything had established that the process could. A skip
+guard only guards the statements after it.
+
+**Why local runs never saw it.** `make vm-test` runs the binary under `sudo`,
+where the mkdir succeeds. The failing path is the *unprivileged* one, which
+locally only ever ran as part of `make test` on macOS — where these tests do not
+compile at all. CI on Linux runs both, and is the only place both halves exist.
+
+**Fix.** `testCgroupRoot` calls `rootfs(t)` itself, so the guard holds whatever
+order the callers use.
+
+**Lesson.** A helper that touches the environment has to carry its own
+precondition; relying on a sibling helper being called first makes the guard
+depend on statement order in every caller, forever. And the skip hazard noted in
+`decisions.md` has a second face: skips make an unprivileged run green, so the
+only signal that an unprivileged run is even *possible* comes from a machine
+that runs both.

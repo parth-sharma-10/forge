@@ -268,6 +268,9 @@ const memoryHog = "x=aaaaaaaaaaaaaaaa; while :; do x=$x$x; done; echo survived"
 // failure cannot leave debris in the tree the machine actually uses.
 func testCgroupRoot(t *testing.T) string {
 	t.Helper()
+	// Three tests call this before rootfs(t), and a skip only guards what runs
+	// after it — so the environment check has to be here too, not only there.
+	rootfs(t)
 	// MkdirTemp, not a name built from the pid: pids recycle, and a root a
 	// previous run left behind arrives with its controllers already enabled.
 	root, err := os.MkdirTemp("/sys/fs/cgroup", "forge-sandbox-test-")
