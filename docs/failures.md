@@ -92,3 +92,108 @@ from the previous entry still holds.
 the code. The unit tests all passed both before and after; only wall-clock
 timestamps from a real signal exposed it. `TestCloseReleasesParkedSubmit` now
 asserts the timing, and fails against the old implementation.
+
+---
+
+## 2026-09-09 — A rootfs symlink that is dangling right up until pivot_root
+
+**Problem.** The sandbox test guard checks that `$FORGE_TEST_ROOTFS` really is a
+root filesystem before running, by stat'ing `bin/sh` inside it. Every sandbox
+test failed at that guard against a freshly unpacked, perfectly good Alpine
+rootfs: `stat /var/tmp/forge-rootfs/bin/sh: no such file or directory`.
+
+**Symptoms.** `ls -l` showed the file present — `bin/sh` as a symlink to
+`/bin/busybox`, and `bin/busybox` as a 919KB executable right next to it — while
+`test -e /var/tmp/forge-rootfs/bin/sh` from the host shell also said no.
+
+**Root cause.** `/bin/sh` is an **absolute** symlink to `/bin/busybox`. Absolute
+symlinks inside a root filesystem resolve against the *resolver's* root, not
+against the directory they live in. From the host that means `/bin/busybox` on
+Ubuntu, which does not exist — so the link is dangling, and `os.Stat`, which
+follows symlinks, is correct to say so. It stops being dangling the instant
+`pivot_root` makes that rootfs `/`.
+
+**Fix.** `os.Lstat` in the guard: ask whether the entry exists, not whether its
+target resolves. One character of API, and the reason is now a comment above it.
+
+**Investigation note.** The first suspicion was a failed `tar` extraction, and
+re-extracting "fixed" nothing while looking like it might have. Listing the link
+and its target separately is what separated the two hypotheses — a missing file
+and an unresolvable one look identical through `os.Stat`.
+
+**Lesson.** A rootfs is only self-consistent from inside itself. Any host-side
+check against one has to be `Lstat`-shaped, and the same trap waits for anything
+that inspects paths in an image before entering it. Related: the sandbox's own
+`exec.LookPath` is correct only because it runs *after* `pivot_root`.
+
+---
+
+## 2026-09-09 — A mutation test leaked a mount and made the next mutation pass
+
+**Problem.** Six mutations of `internal/sandbox` were run to prove the tests
+catch them. Five failed as expected. Deleting the rootfs bind mount — the line
+that exists solely to satisfy `pivot_root`'s "new root must be a mount point"
+requirement — left the whole suite **passing**.
+
+**Symptoms.** `findmnt` on the VM, after the mutation batch:
+
+```
+/var/tmp/forge-rootfs   /dev/vda1[/var/tmp/forge-rootfs]   shared
+```
+
+A bind mount of the rootfs, in the *host* mount namespace, owned by nothing.
+
+**Root cause.** Two bugs stacked, and the first created the second.
+
+1. An earlier mutation in the same batch removed the
+   `mount("none", "/", MS_REC|MS_PRIVATE)` call. The VM's `/` is `shared:1`, so
+   the child's bind mount propagated straight back into the host's peer group
+   and outlived the namespace that made it. That mutation was correctly reported
+   as caught — but its side effect persisted.
+2. That leftover mount then made `/var/tmp/forge-rootfs` a mount point for free,
+   so the *next* mutation, which removes the code that creates exactly that
+   property, had nothing left to break.
+
+**Investigation.** The gap was on a security property, so "the test is weak" and
+"the environment is lying" had to be separated rather than guessed between.
+Unmounting the leak and re-running the same mutation on a clean host gave
+`pivot_root /var/tmp/forge-rootfs: device or resource busy` — EBUSY, not the
+EINVAL the man page's wording suggests, which is itself worth knowing.
+Re-creating the leak deliberately and running the *unmutated* binary confirmed
+the other half: `TestMountsDoNotLeakToHost` does fail on a dirty host. No test
+was weak; only the order the mutations ran in hid one.
+
+**Fix.** The test guard now refuses to run at all when the rootfs is already
+mounted in the host namespace, naming the `umount` to run. A leak can no longer
+be silently inherited by the next run — it fails loudly at the first test.
+
+**Lesson.** A mutation that changes global state has to be cleaned up before the
+next one, or the following experiment measures the residue instead of the code.
+Test isolation is not only about parallel tests: sequential runs share a kernel.
+And the reason the leak was possible at all is the thing the code under test
+exists to prevent — `MS_PRIVATE` is not defensive tidiness, it is the difference
+between a sandbox and a mount the host is now stuck with.
+
+---
+
+## 2026-09-09 — Counting processes in a forking shell is a race
+
+**Problem.** `TestProcIsTheSandboxProcessTable` asserted that a sandboxed
+`ls /proc | grep -c '^[0-9]'` reports one or two processes rather than the
+host's hundreds. It passed once, then failed on every subsequent run with 3.
+
+**Root cause.** The assertion counted something the test itself creates. The
+script is `cat /proc/1/comm; ls /proc | grep -c ...`, and busybox `sh` forks for
+each stage of the pipeline, so `ls` reads `/proc` with `sh`, `ls` and `grep` all
+live — three entries, or fewer if a stage has already exited. The exact count is
+a scheduling outcome.
+
+**Fix.** Assert something the sandbox cannot influence: the host test process's
+own PID has no `/proc` entry inside. Deterministic, and it fails far more
+legibly — dropping `CLONE_NEWPID` now yields `"systemd\nLEAKED"` against a want
+of `"sh\nISOLATED"`, which names the bug in the diff. Ten consecutive suite runs
+are clean.
+
+**Lesson.** An assertion about "how many" is usually an assertion about timing
+wearing a disguise. Prefer a fact the code under test either exposes or hides —
+presence or absence — over a count of things the test itself spawned.

@@ -19,3 +19,8 @@ jobs:
           cache: false
       - run: make test
       - run: make build
+
+      # The isolation tests need a real kernel and CAP_SYS_ADMIN, so they are
+      # a separate step: `make test` above runs unprivileged and would skip
+      # every one of them. GitHub's runners give passwordless sudo.
+      - run: make test-sandbox
