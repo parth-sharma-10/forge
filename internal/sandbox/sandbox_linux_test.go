@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/parth-sharma-10/forge/internal/cgroup"
 )
 
 // TestMain gives the test binary the same dual identity every Forge binary
@@ -75,14 +77,15 @@ func sh(t *testing.T, script string) (string, error) {
 
 func runArgs(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	return runSpec(t, Spec{Rootfs: rootfs(t), Hostname: "forge-test", Args: args})
+}
+
+// runSpec runs spec with its output captured, and returns that output trimmed.
+func runSpec(t *testing.T, spec Spec) (string, error) {
+	t.Helper()
 	var out bytes.Buffer
-	err := Run(context.Background(), Spec{
-		Rootfs:   rootfs(t),
-		Hostname: "forge-test",
-		Args:     args,
-		Stdout:   &out,
-		Stderr:   &out,
-	})
+	spec.Stdout, spec.Stderr = &out, &out
+	err := Run(context.Background(), spec)
 	return strings.TrimSpace(out.String()), err
 }
 
@@ -255,5 +258,154 @@ func TestContextCancelKillsTheSandbox(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("sandbox outlived its cancelled context")
+	}
+}
+
+// memoryHog allocates without bound until the kernel stops it.
+const memoryHog = "x=aaaaaaaaaaaaaaaa; while :; do x=$x$x; done; echo survived"
+
+// testCgroupRoot keeps each test's job cgroups under a parent of our own, so a
+// failure cannot leave debris in the tree the machine actually uses.
+func testCgroupRoot(t *testing.T) string {
+	t.Helper()
+	// MkdirTemp, not a name built from the pid: pids recycle, and a root a
+	// previous run left behind arrives with its controllers already enabled.
+	root, err := os.MkdirTemp("/sys/fs/cgroup", "forge-sandbox-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Removable only if every job cgroup under it was cleaned up.
+		if err := os.Remove(root); err != nil && !os.IsNotExist(err) {
+			t.Errorf("test cgroup root not empty at the end of the test: %v", err)
+		}
+	})
+	return root
+}
+
+// TestMemoryLimitIsReportedAsAnOOMKill is the assertion behind reading
+// memory.events at all. The exit status of an OOM-killed build is SIGKILL,
+// which is also what a timeout and an operator's kill -9 look like; only the
+// cgroup can say which happened.
+func TestMemoryLimitIsReportedAsAnOOMKill(t *testing.T) {
+	var out bytes.Buffer
+	err := Run(context.Background(), Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: testCgroupRoot(t),
+		Limits:     cgroup.Limits{MemoryBytes: 16 << 20},
+		// Doubling a shell variable, rather than reading a large stream into
+		// one: the sandbox has no /dev to read zeroes from, and a pipe-fed
+		// workload charges page cache to the same cgroup, so the kernel
+		// reclaims busybox's own pages and thrashes for seconds before it
+		// OOMs. Doubling is pure anonymous memory and reaches the cap in
+		// about twenty iterations.
+		Args:   []string{"/bin/sh", "-c", memoryHog},
+		Stdout: &out,
+		Stderr: &out,
+	})
+
+	if !errors.Is(err, ErrOOMKilled) {
+		t.Fatalf("err = %v, want it to wrap ErrOOMKilled (output %q)", err, out.String())
+	}
+	// The error must still carry the status, so a caller that only knows about
+	// exit codes is not left with nothing.
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("err = %v, want it to also unwrap to *exec.ExitError", err)
+	}
+	if strings.Contains(out.String(), "survived") {
+		t.Fatalf("the build ran to completion despite a 16MiB limit: %q", out.String())
+	}
+}
+
+func TestAJobWithinItsMemoryLimitIsNotReportedAsOOM(t *testing.T) {
+	out, err := runSpec(t, Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: testCgroupRoot(t),
+		Limits:     cgroup.Limits{MemoryBytes: 64 << 20, MaxPIDs: 32},
+		Args:       []string{"/bin/sh", "-c", "x=aaaaaaaaaaaaaaaa; for i in 1 2 3 4 5 6; do x=$x$x; done; echo survived"},
+	})
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "survived" {
+		t.Fatalf("output = %q, want survived", out)
+	}
+}
+
+func TestSandboxRunsInsideItsOwnCgroup(t *testing.T) {
+	root := testCgroupRoot(t)
+	out, err := runSpec(t, Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Limits:     cgroup.Limits{MemoryBytes: 64 << 20},
+		// /proc is the sandbox's own mount, and without a cgroup namespace
+		// this reports the full path from the cgroup root.
+		Args: []string{"/bin/sh", "-c", "cat /proc/self/cgroup"},
+	})
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := strings.TrimPrefix(root, "/sys/fs/cgroup") + "/job-"
+	if !strings.Contains(out, want) {
+		t.Fatalf("/proc/self/cgroup = %q, want it under %q", out, want)
+	}
+}
+
+func TestCgroupIsRemovedAfterTheJob(t *testing.T) {
+	root := testCgroupRoot(t)
+	if out, err := runSpec(t, Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Limits:     cgroup.Limits{MemoryBytes: 64 << 20},
+		Args:       []string{"/bin/sh", "-c", "true"},
+	}); err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "job-") {
+			t.Fatalf("job cgroup %s survived the run: one leaked kernel object per build", e.Name())
+		}
+	}
+}
+
+// TestCgroupIsRemovedAfterAnOOMKill covers the path where the job did not exit
+// on its own terms — the cleanup has to survive the kernel still reaping it.
+func TestCgroupIsRemovedAfterAnOOMKill(t *testing.T) {
+	root := testCgroupRoot(t)
+	err := Run(context.Background(), Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Limits:     cgroup.Limits{MemoryBytes: 16 << 20},
+		Args:       []string{"/bin/sh", "-c", memoryHog},
+	})
+	if !errors.Is(err, ErrOOMKilled) {
+		t.Fatalf("err = %v, want ErrOOMKilled", err)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "job-") {
+			t.Fatalf("job cgroup %s survived an OOM-killed run", e.Name())
+		}
+	}
+}
+
+func TestInvalidLimitsAreRejectedBeforeAnythingRuns(t *testing.T) {
+	err := Run(context.Background(), Spec{
+		Rootfs: t.TempDir(),
+		Args:   []string{"/bin/sh"},
+		Limits: cgroup.Limits{MemoryBytes: -1},
+	})
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("err = %v, want a validation error naming the negative limit", err)
 	}
 }
