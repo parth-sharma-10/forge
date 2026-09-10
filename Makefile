@@ -17,6 +17,7 @@ ALPINE_SHA256 = $(ALPINE_SHA256_$(ALPINE_ARCH))
 VM ?= colima
 VM_GOARCH = $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 VM_TEST_BIN = $(HOME)/.cache/forge/sandbox.test
+VM_CGROUP_BIN = $(HOME)/.cache/forge/cgroup.test
 
 .PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell
 
@@ -40,7 +41,7 @@ build:
 
 clean:
 	$(GO) clean -testcache
-	rm -f $(VM_TEST_BIN)
+	rm -f $(VM_TEST_BIN) $(VM_CGROUP_BIN)
 
 ## rootfs: unpack an Alpine root filesystem for the sandbox to run in
 rootfs:
@@ -56,12 +57,14 @@ rootfs:
 # `sudo go test`: root has a different GOCACHE and would rebuild the world.
 test-sandbox: rootfs
 	$(GO) test -c -o /tmp/forge-sandbox.test ./internal/sandbox
+	$(GO) test -c -o /tmp/forge-cgroup.test ./internal/cgroup
 	sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1
+	sudo /tmp/forge-cgroup.test -test.v -test.count=1
 
 ## vm-test: run the sandbox tests inside the colima VM (macOS hosts)
 # colima mounts $HOME into the VM at the same path, so the cross-compiled test
 # binary needs no copying in and the VM needs no Go toolchain.
-vm-test: $(VM_TEST_BIN)
+vm-test: $(VM_TEST_BIN) $(VM_CGROUP_BIN)
 	$(VM) ssh -- sh -euc '\
 	  if [ ! -x $(ROOTFS)/bin/sh ]; then \
 	    curl -fsSL $(ALPINE_URL) -o /tmp/rootfs.tgz; \
@@ -69,11 +72,17 @@ vm-test: $(VM_TEST_BIN)
 	    sudo mkdir -p $(ROOTFS); sudo tar -xzf /tmp/rootfs.tgz -C $(ROOTFS); \
 	  fi; \
 	  cp $(VM_TEST_BIN) /tmp/forge-sandbox.test; \
-	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1'
+	  cp $(VM_CGROUP_BIN) /tmp/forge-cgroup.test; \
+	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1; \
+	  sudo /tmp/forge-cgroup.test -test.v -test.count=1'
 
-$(VM_TEST_BIN): $(wildcard internal/sandbox/*.go)
+$(VM_TEST_BIN): $(wildcard internal/sandbox/*.go) $(wildcard internal/cgroup/*.go)
 	@mkdir -p $(dir $@)
 	GOOS=linux GOARCH=$(VM_GOARCH) $(GO) test -c -o $@ ./internal/sandbox
+
+$(VM_CGROUP_BIN): $(wildcard internal/cgroup/*.go)
+	@mkdir -p $(dir $@)
+	GOOS=linux GOARCH=$(VM_GOARCH) $(GO) test -c -o $@ ./internal/cgroup
 
 vm-shell:
 	$(VM) ssh

@@ -13,6 +13,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/parth-sharma-10/forge/internal/cgroup"
 )
 
 // TestMain gives the test binary the same dual identity every Forge binary
@@ -75,14 +77,15 @@ func sh(t *testing.T, script string) (string, error) {
 
 func runArgs(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	return runSpec(t, Spec{Rootfs: rootfs(t), Hostname: "forge-test", Args: args})
+}
+
+// runSpec runs spec with its output captured, and returns that output trimmed.
+func runSpec(t *testing.T, spec Spec) (string, error) {
+	t.Helper()
 	var out bytes.Buffer
-	err := Run(context.Background(), Spec{
-		Rootfs:   rootfs(t),
-		Hostname: "forge-test",
-		Args:     args,
-		Stdout:   &out,
-		Stderr:   &out,
-	})
+	spec.Stdout, spec.Stderr = &out, &out
+	err := Run(context.Background(), spec)
 	return strings.TrimSpace(out.String()), err
 }
 
@@ -210,6 +213,130 @@ func TestMountsDoNotLeakToHost(t *testing.T) {
 	}
 }
 
+// devScript exercises each node by what it does rather than by its major and
+// minor numbers: a node made from the wrong pair still passes an `ls -l`
+// assertion on the numbers this test would have hard-coded, but /dev/full does
+// not refuse a write unless it really is 1:7.
+const devScript = `
+for n in null zero full random urandom tty; do [ -c /dev/$n ] || echo "MISSING $n"; done
+echo discarded > /dev/null
+[ -s /dev/null ] && echo null-is-a-file || echo null-discards
+dd if=/dev/zero bs=4 count=1 2>/dev/null | wc -c
+dd if=/dev/urandom bs=16 count=1 2>/dev/null | wc -c
+echo x > /dev/full 2>/dev/null && echo full-accepted || echo full-refused
+echo piped | cat /dev/stdin
+ls /dev/fd > /dev/null && echo fd-ok
+`
+
+func TestDevNodesBehaveLikeTheirKernelDevices(t *testing.T) {
+	out, err := sh(t, devScript)
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := "null-discards\n4\n16\nfull-refused\npiped\nfd-ok"
+	if out != want {
+		t.Fatalf("got:\n%s\n\nwant:\n%s", out, want)
+	}
+}
+
+// TestDevNodesAreWritableByAnyone is the assertion behind zeroing the umask
+// before mknod. Without it the inherited 022 leaves /dev/null at 0644, which
+// works for exactly as long as every build runs as root — that is, until the
+// user namespace lands and the failure looks like something else entirely.
+func TestDevNodesAreWritableByAnyone(t *testing.T) {
+	out, err := sh(t, "ls -l /dev/null | cut -c1-10")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "crw-rw-rw-" {
+		t.Fatalf("/dev/null mode = %q, want crw-rw-rw-", out)
+	}
+}
+
+// TestABackgroundJobPrintsNothing is the symptom that sent us here: sh opens
+// /dev/null for every job it backgrounds, so before there was a /dev, any
+// build script containing `&` printed an error per `&`.
+func TestABackgroundJobPrintsNothing(t *testing.T) {
+	out, err := sh(t, "sleep 0 & wait; echo done")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "done" {
+		t.Fatalf("output = %q, want just \"done\": backgrounding a job still writes to stderr", out)
+	}
+}
+
+// TestDevIsOnlyTheMinimalSet fails if anyone ever "fixes" a missing device by
+// bind-mounting the host's /dev in. A sandbox that can open /dev/sda or
+// /dev/mem has no boundary left worth the name.
+func TestDevIsOnlyTheMinimalSet(t *testing.T) {
+	out, err := sh(t, "ls -a /dev | sort | tr '\\n' ' '")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := ". .. fd full null random stderr stdin stdout tty urandom zero"
+	if out != want {
+		t.Fatalf("/dev = %q, want %q", out, want)
+	}
+}
+
+// TestDevDoesNotOutliveTheSandbox covers the cleanup path, which is the mount
+// namespace's rather than any code's: nothing unmounts /dev, so the test is
+// that nothing has to. It runs a build that is killed rather than one that
+// exits, since a clean exit is the case least likely to leave anything behind.
+func TestDevDoesNotOutliveTheSandbox(t *testing.T) {
+	dir := rootfs(t)
+	dev := filepath.Join(dir, "dev")
+	if dirt := emptyDir(t, dev); len(dirt) != 0 {
+		t.Logf("%s was not empty before the run (%v) — a manual run or a crash left it; cleared", dev, dirt)
+	}
+
+	spec := Spec{Rootfs: dir, Args: []string{"/bin/sh", "-c", "echo contaminated > /dev/null; sleep 60"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, spec) }()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("sandbox outlived its cancelled context")
+	}
+
+	if mountedOnHost(t, dev) {
+		t.Fatalf("the sandbox's tmpfs on %s survived in the host mount namespace", dev)
+	}
+	// The whole reason /dev is a mount and not a set of files: the rootfs
+	// image is shared by every build on the worker, and a `> /dev/null` in one
+	// of them would otherwise leave a regular file behind for the next.
+	if leaked := emptyDir(t, dev); len(leaked) != 0 {
+		t.Fatalf("%s is not empty after the run (%v): the build wrote into the rootfs image", dev, leaked)
+	}
+}
+
+// emptyDir removes everything in dir and returns what it removed.
+//
+// The removal is the point, not a convenience. This assertion is about the
+// rootfs image being clean, and an assertion that leaves the image dirty when
+// it fails makes every later run in the same sandbox fail for a reason that
+// has nothing to do with the code under test — as one leftover /dev/null makes
+// the next run's mknod fail with EEXIST, taking the whole suite with it.
+func emptyDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			t.Errorf("clearing %s: %v", dir, err)
+		}
+	}
+	return names
+}
+
 func TestExitStatusPropagates(t *testing.T) {
 	_, err := sh(t, "exit 7")
 	var exitErr *exec.ExitError
@@ -255,5 +382,156 @@ func TestContextCancelKillsTheSandbox(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("sandbox outlived its cancelled context")
+	}
+}
+
+// memoryHog allocates without bound until the kernel stops it.
+const memoryHog = "x=aaaaaaaaaaaaaaaa; while :; do x=$x$x; done; echo survived"
+
+// testCgroupRoot keeps each test's job cgroups under a parent of our own, so a
+// failure cannot leave debris in the tree the machine actually uses.
+func testCgroupRoot(t *testing.T) string {
+	t.Helper()
+	// Three tests call this before rootfs(t), and a skip only guards what runs
+	// after it — so the environment check has to be here too, not only there.
+	rootfs(t)
+	// MkdirTemp, not a name built from the pid: pids recycle, and a root a
+	// previous run left behind arrives with its controllers already enabled.
+	root, err := os.MkdirTemp("/sys/fs/cgroup", "forge-sandbox-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Removable only if every job cgroup under it was cleaned up.
+		if err := os.Remove(root); err != nil && !os.IsNotExist(err) {
+			t.Errorf("test cgroup root not empty at the end of the test: %v", err)
+		}
+	})
+	return root
+}
+
+// TestMemoryLimitIsReportedAsAnOOMKill is the assertion behind reading
+// memory.events at all. The exit status of an OOM-killed build is SIGKILL,
+// which is also what a timeout and an operator's kill -9 look like; only the
+// cgroup can say which happened.
+func TestMemoryLimitIsReportedAsAnOOMKill(t *testing.T) {
+	var out bytes.Buffer
+	err := Run(context.Background(), Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: testCgroupRoot(t),
+		Limits:     cgroup.Limits{MemoryBytes: 16 << 20},
+		// Doubling a shell variable, rather than reading /dev/zero into one:
+		// a pipe-fed workload charges page cache to the same cgroup, so the
+		// kernel reclaims busybox's own pages and thrashes for seconds before
+		// it OOMs. Doubling is pure anonymous memory and reaches the cap in
+		// about twenty iterations.
+		Args:   []string{"/bin/sh", "-c", memoryHog},
+		Stdout: &out,
+		Stderr: &out,
+	})
+
+	if !errors.Is(err, ErrOOMKilled) {
+		t.Fatalf("err = %v, want it to wrap ErrOOMKilled (output %q)", err, out.String())
+	}
+	// The error must still carry the status, so a caller that only knows about
+	// exit codes is not left with nothing.
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("err = %v, want it to also unwrap to *exec.ExitError", err)
+	}
+	if strings.Contains(out.String(), "survived") {
+		t.Fatalf("the build ran to completion despite a 16MiB limit: %q", out.String())
+	}
+}
+
+func TestAJobWithinItsMemoryLimitIsNotReportedAsOOM(t *testing.T) {
+	out, err := runSpec(t, Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: testCgroupRoot(t),
+		Limits:     cgroup.Limits{MemoryBytes: 64 << 20, MaxPIDs: 32},
+		Args:       []string{"/bin/sh", "-c", "x=aaaaaaaaaaaaaaaa; for i in 1 2 3 4 5 6; do x=$x$x; done; echo survived"},
+	})
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "survived" {
+		t.Fatalf("output = %q, want survived", out)
+	}
+}
+
+func TestSandboxRunsInsideItsOwnCgroup(t *testing.T) {
+	root := testCgroupRoot(t)
+	out, err := runSpec(t, Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Limits:     cgroup.Limits{MemoryBytes: 64 << 20},
+		// /proc is the sandbox's own mount, and without a cgroup namespace
+		// this reports the full path from the cgroup root.
+		Args: []string{"/bin/sh", "-c", "cat /proc/self/cgroup"},
+	})
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := strings.TrimPrefix(root, "/sys/fs/cgroup") + "/job-"
+	if !strings.Contains(out, want) {
+		t.Fatalf("/proc/self/cgroup = %q, want it under %q", out, want)
+	}
+}
+
+func TestCgroupIsRemovedAfterTheJob(t *testing.T) {
+	root := testCgroupRoot(t)
+	if out, err := runSpec(t, Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Limits:     cgroup.Limits{MemoryBytes: 64 << 20},
+		Args:       []string{"/bin/sh", "-c", "true"},
+	}); err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "job-") {
+			t.Fatalf("job cgroup %s survived the run: one leaked kernel object per build", e.Name())
+		}
+	}
+}
+
+// TestCgroupIsRemovedAfterAnOOMKill covers the path where the job did not exit
+// on its own terms — the cleanup has to survive the kernel still reaping it.
+func TestCgroupIsRemovedAfterAnOOMKill(t *testing.T) {
+	root := testCgroupRoot(t)
+	err := Run(context.Background(), Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Limits:     cgroup.Limits{MemoryBytes: 16 << 20},
+		Args:       []string{"/bin/sh", "-c", memoryHog},
+	})
+	if !errors.Is(err, ErrOOMKilled) {
+		t.Fatalf("err = %v, want ErrOOMKilled", err)
+	}
+
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "job-") {
+			t.Fatalf("job cgroup %s survived an OOM-killed run", e.Name())
+		}
+	}
+}
+
+func TestInvalidLimitsAreRejectedBeforeAnythingRuns(t *testing.T) {
+	err := Run(context.Background(), Spec{
+		Rootfs: t.TempDir(),
+		Args:   []string{"/bin/sh"},
+		Limits: cgroup.Limits{MemoryBytes: -1},
+	})
+	if err == nil || !strings.Contains(err.Error(), "negative") {
+		t.Fatalf("err = %v, want a validation error naming the negative limit", err)
 	}
 }

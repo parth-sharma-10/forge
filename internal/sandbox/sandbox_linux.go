@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"syscall"
+
+	"github.com/parth-sharma-10/forge/internal/cgroup"
 )
 
 // namespaces is the isolation applied at clone time. All five are unshared in
@@ -43,6 +45,12 @@ func Run(ctx context.Context, spec Spec) error {
 		return err
 	}
 
+	group, err := cgroup.Create(spec.CgroupRoot, spec.Limits)
+	if err != nil {
+		return err
+	}
+	defer group.Close()
+
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", append([]string{ChildArg}, spec.Args...)...)
 	cmd.Env = []string{
 		envRootfs + "=" + spec.Rootfs,
@@ -54,12 +62,108 @@ func Run(ctx context.Context, spec Spec) error {
 		// A worker that dies mid-build must not leave the build running: the
 		// sandbox has no supervisor of its own to notice.
 		Pdeathsig: syscall.SIGKILL,
+		// The kernel puts the child in the cgroup as part of the clone, so the
+		// limits are in force before the child's first instruction. Setting
+		// them by writing cgroup.procs after Start would leave a window in
+		// which the build runs uncapped.
+		UseCgroupFD: true,
+		CgroupFD:    group.FD(),
 	}
 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("sandbox: start child (needs CAP_SYS_ADMIN — run as root): %w", err)
 	}
-	return cmd.Wait()
+	runErr := cmd.Wait()
+
+	// Asked after the wait and before Close removes the cgroup: this is the
+	// only moment the counter is both final and still readable.
+	if runErr != nil {
+		if oom, err := group.OOMKilled(); err != nil {
+			return fmt.Errorf("%w (could not check for an OOM kill: %w)", runErr, err)
+		} else if oom {
+			return fmt.Errorf("%w: %w", ErrOOMKilled, runErr)
+		}
+	}
+	return runErr
+}
+
+// devNodes are the character devices a build expects to find. The major and
+// minor numbers are the kernel's, fixed in Documentation/admin-guide/devices.txt
+// — they are not chosen here and must not be invented.
+var devNodes = []struct {
+	name         string
+	major, minor uint32
+}{
+	{"null", 1, 3},
+	{"zero", 1, 5},
+	{"full", 1, 7},
+	{"random", 1, 8},
+	{"urandom", 1, 9},
+	// Opening this with no controlling terminal fails with ENXIO, which is
+	// what a tool probing for a tty expects to see. Its absence is not.
+	{"tty", 5, 0},
+}
+
+// devLinks resolve through the sandbox's own /proc, so they name its file
+// descriptors rather than the host's.
+var devLinks = [][2]string{
+	{"fd", "/proc/self/fd"},
+	{"stdin", "/proc/self/fd/0"},
+	{"stdout", "/proc/self/fd/1"},
+	{"stderr", "/proc/self/fd/2"},
+}
+
+// mountDev gives the sandbox a private /dev holding nothing but the nodes
+// above.
+//
+// The host's /dev is never consulted, let alone bind-mounted in: a sandbox
+// that can reach /dev/sda or /dev/mem is not a sandbox. These nodes are made
+// from their kernel numbers on a fresh tmpfs, so the set is exactly what is
+// listed here and nothing depends on what the host happens to have.
+//
+// The tmpfs is also what keeps the nodes out of the rootfs image. Without it
+// the image's empty dev/ directory is writable, so a build redirecting to
+// /dev/null quietly creates a regular file of that name — in a directory the
+// next build on this worker will inherit.
+//
+// ponytail: no /dev/shm, /dev/ptmx or devpts. Nothing needs them until a build
+// wants a pty or POSIX shared memory; add them when one does.
+func mountDev() error {
+	// mknod's mode is masked by the umask, which would leave /dev/null at
+	// 0644 and unwritable by any build that is not root.
+	old := syscall.Umask(0)
+	defer syscall.Umask(old)
+
+	if err := os.MkdirAll("/dev", 0o755); err != nil {
+		return fmt.Errorf("sandbox: %w", err)
+	}
+	// Not MS_NODEV, which would make every node below inert — that flag is
+	// for filesystems that have no business carrying devices, and this one's
+	// entire purpose is to carry six of them. 64k is room for the nodes and
+	// the symlinks and nothing else.
+	const devFlags = syscall.MS_NOSUID | syscall.MS_NOEXEC
+	if err := syscall.Mount("tmpfs", "/dev", "tmpfs", devFlags, "mode=0755,size=64k"); err != nil {
+		return fmt.Errorf("sandbox: mount /dev: %w", err)
+	}
+	for _, n := range devNodes {
+		path := "/dev/" + n.name
+		if err := syscall.Mknod(path, syscall.S_IFCHR|0o666, mkdev(n.major, n.minor)); err != nil {
+			return fmt.Errorf("sandbox: mknod %s (c %d:%d): %w", path, n.major, n.minor, err)
+		}
+	}
+	for _, l := range devLinks {
+		if err := os.Symlink(l[1], "/dev/"+l[0]); err != nil {
+			return fmt.Errorf("sandbox: %w", err)
+		}
+	}
+	return nil
+}
+
+// mkdev packs a device number the way mknod(2) takes it — Linux's
+// new_encode_dev, which splits the minor around the major rather than putting
+// the two side by side.
+func mkdev(major, minor uint32) int {
+	return int((minor & 0xff) | (major << 8) | ((minor &^ 0xff) << 12))
 }
 
 // MaybeChild applies the sandbox to this process and execs the build command
@@ -84,7 +188,10 @@ func MaybeChild() {
 //  3. pivot_root, then detach the old root, so no path to the host remains
 //     (chroot alone would leave one — an open directory fd escapes it);
 //  4. only then mount /proc, so it is the new PID namespace's view rather
-//     than the host's process table.
+//     than the host's process table;
+//  5. mount a tmpfs /dev and make the standard nodes on it, so a build that
+//     opens /dev/null does not instead create a file of that name in the
+//     shared rootfs image.
 func child() error {
 	rootfs := os.Getenv(envRootfs)
 	if rootfs == "" {
@@ -138,9 +245,9 @@ func child() error {
 		return fmt.Errorf("sandbox: mount /proc: %w", err)
 	}
 
-	// ponytail: /dev is whatever the image ships, usually nothing, so a build
-	// that writes to /dev/null fails. Needs a tmpfs with the standard nodes
-	// bind-mounted in — that lands with the cgroup and device-cgroup work.
+	if err := mountDev(); err != nil {
+		return err
+	}
 
 	if err := os.Setenv("PATH", sandboxPATH); err != nil {
 		return fmt.Errorf("sandbox: %w", err)
