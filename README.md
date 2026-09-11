@@ -5,10 +5,11 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phase 0, Week 4 of 5 phases.** What exists today is the bounded worker
+**Status: Phase 0, Week 5 of 5 phases.** What exists today is the bounded worker
 pool, the sandbox's namespace isolation and private device filesystem, per-job
-cgroups v2 resource limits, and a deny-by-default seccomp filter. The API, the queue and everything
-distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
+cgroups v2 resource limits, a deny-by-default seccomp filter, and a user
+namespace that makes sandbox root an unprivileged uid on the host. The API, the
+queue and everything distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented and [docs/decisions.md](docs/decisions.md) for why.
 
 ## Quickstart
@@ -83,8 +84,9 @@ unavailable`) rather than letting a runaway `make -j` take the worker down.
 ### Devices
 
 The sandbox gets a `/dev` of its own — a tmpfs holding six character devices
-and four symlinks, made from the kernel's device numbers rather than copied
-from the host, so a build cannot reach `/dev/sda` or `/dev/mem` through it.
+and four symlinks, and nothing else, so a build cannot reach `/dev/sda` or
+`/dev/mem` through it. The six are bind mounts of the host's nodes, each one
+checked against the kernel's major and minor numbers before it is bound.
 
 ```
 $ sudo /tmp/forged -rootfs /var/tmp/forge-rootfs -- /bin/sh -c 'ls /dev; sleep 0 & wait; echo ok'
@@ -105,6 +107,32 @@ Without it, `sh` printed `can't open '/dev/null'` for every backgrounded job,
 `dd if=/dev/urandom` failed outright — and, worse, `echo hi > /dev/null`
 *succeeded*, leaving a regular file called `null` in the rootfs image that
 every later build on the worker inherited.
+
+### Sandbox root is not host root
+
+The build is uid 0 inside its user namespace and uid 524288 outside it. What it
+creates belongs to that uid on the host; what the rootfs image carries belongs
+to host root, which the namespace does not map, so from inside it reads as
+nobody.
+
+```
+$ sudo /tmp/forged -rootfs /var/tmp/forge-rootfs -- /bin/sh -c \
+    'id; stat -c "%u %g %n" /bin/busybox; echo hi > /tmp/probe; stat -c "%u %g %n" /tmp/probe'
+uid=0(root) gid=0(root) groups=65534(nobody)
+65534 65534 /bin/busybox
+0 0 /tmp/probe
+
+$ stat -c "%u %g %n" /var/tmp/forge-rootfs/tmp/probe
+524288 524288 /var/tmp/forge-rootfs/tmp/probe
+```
+
+The single supplementary group is the overflow gid — host root's group, which
+the map does not cover either. `setgroups` is denied inside the namespace, so a
+build cannot trade it for one that names something.
+
+A consequence worth knowing before it surprises you: the rootfs image is owned
+by host root and is therefore no longer writable from inside the sandbox. A
+build can write to `/tmp` and nowhere else in the image.
 
 ### The worker pool
 
@@ -132,6 +160,7 @@ cmd/forged         sandbox runtime               implemented
 internal/pool      bounded worker pool           implemented
 internal/sandbox   namespaces, pivot_root, /dev  implemented
                    seccomp allowlist             implemented
+                   user namespace and id map     implemented
 internal/cgroup    cgroups v2 memory/cpu/pids    implemented
 internal/queue     PostgreSQL queue, leases      (not built yet)
 internal/cas       content-addressed storage     (not built yet)
@@ -143,15 +172,24 @@ docs/              architecture, decisions, failures
 Go 1.27+, and no third-party dependencies — `go.mod` has no `require` block.
 
 The sandbox needs `CAP_SYS_ADMIN` and a Linux kernel with cgroups v2 and
-`CLONE_INTO_CGROUP` — 5.7 or newer. Those packages are behind `//go:build
+`CLONE_INTO_CGROUP` — 5.7 or newer. It re-executes itself after dropping to the
+mapped uid, so the Forge binary has to be readable and executable by that uid:
+a worker installed mode `0700` starts nothing.
+
+It also needs a fully visible `/proc` on the host, which is what a worker
+running inside another container usually does not have — a masked `/proc`
+leaves the sandbox unable to mount one of its own, and the kernel reports that
+as `EPERM` rather than as what it is. Those packages are behind `//go:build
 linux`; CI runs their tests on `ubuntu-latest`, and a macOS host runs them
 through `make vm-test` against a colima VM.
 
 ## Limitations
 
-The sandbox isolates against *accident*, and against a hostile build only as
-far as the syscall filter reaches. There is no user namespace yet, so root
-inside the sandbox is root on the host.
+Every job on a worker is mapped to the same host uid, so this is a boundary
+between a build and the host, not between two builds on the same worker. The
+rootfs image is shared too — it is no longer writable, but its `/tmp` is, and
+that is enough for one build to leave something for the next. Both want a
+per-job overlay.
 
 The seccomp filter is an allowlist of syscall *numbers*; it never looks at
 arguments. `clone` has to be allowed for a build to fork at all, so its flags
@@ -162,9 +200,14 @@ kernel in a build log rather than like a denial.
 
 The `/dev` the sandbox provides is six nodes and four symlinks, and nothing
 else. A build that wants a pty or POSIX shared memory (`/dev/ptmx`,
-`/dev/shm`) does not get one yet. Making new device nodes is now denied by the
-filter rather than by capabilities: sandbox root still holds `CAP_MKNOD`, and
-gets `ENOSYS` from `mknod` regardless.
+`/dev/shm`) does not get one yet. Making new device nodes is denied twice over:
+the filter answers `mknod` with `ENOSYS`, and the user namespace would refuse
+it anyway.
+
+A build still holds a full capability set *inside* its namespaces. What that
+buys it is bounded by the map — the capabilities do not reach a uid the
+namespace cannot name — and by the filter, which denies the syscalls that would
+use them. Dropping the bounding set as well is worth doing and is not done.
 
 There is also still no API, no persistence, and no benchmark numbers — and none
 will be quoted here until a harness produces them.

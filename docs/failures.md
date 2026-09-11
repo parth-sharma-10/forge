@@ -487,3 +487,57 @@ miss is a more honest number than 11/11 bought with a test that reruns the
 child a thousand times hoping to catch a scheduler. A mutation that survives
 because the hazard it creates is rare is still a real hazard — the mutation
 score measures the tests, and here the tests are as good as they can be.
+
+---
+
+## 2026-09-11 — A user namespace made `mount -t proc` EPERM, and capabilities were not the reason
+
+**Problem.** Adding `CLONE_NEWUSER` to the clone flags turned every privileged
+sandbox test red at the same line: `sandbox: mount /proc: operation not
+permitted`. Everything before it — the bind of the rootfs, six device binds,
+`pivot_root`, the detach of the old root — succeeded, in the same process,
+under the same capabilities.
+
+**Symptoms.** Exit status 125 (the sandbox failed to build, not the command)
+from all 30 tests that run a command; the six tests that read the seccomp
+program without a kernel still passed.
+
+**Root cause.** A fresh `proc` instance can be mounted from a non-initial user
+namespace only while a *fully visible* `proc` is already mounted in the mount
+namespace — `mount_too_revealing` and `mnt_already_visible` in
+`fs/namespace.c`. The sandbox mounted `/proc` after `pivot_root` and after
+detaching the old root, and the old root is what carried the host's `/proc`.
+Detaching it removed the last fully visible instance, leaving the next mount
+nothing to be measured against. In the initial user namespace that check
+returns early, which is why the ordering was correct for four weeks and stopped
+being correct without being edited.
+
+**Investigation.** The errno names a permission, so the first suspect was the
+capability set: the child now drops from host root to a mapped uid, and a uid
+change normally clears every capability. Rather than act on the likeliest
+cause, three `unshare(1)` runs in the VM separated it from the alternative:
+
+```
+A  bind rootfs;                                  mount -t proc  → OK
+B  bind rootfs; pivot_root . .; umount -l .;     mount -t proc  → EPERM
+C  bind rootfs; pivot_root . .; mount -t proc;   umount -l .    → OK
+```
+
+C holds exactly the capabilities B holds and differs only in whether the host's
+mount tree is still attached. So the capability set was not the variable, and
+the `Credential` change was not on trial.
+
+**Fix.** Mount `proc` onto the rootfs's own `proc` directory before
+`pivot_root`, next to `/dev`. The instance is still the new PID namespace's
+process table — that is fixed by the namespace of the process doing the
+mounting, not by where the mount point sits or what has been detached. Which
+means the ordering comment this code has carried since Week 2, claiming `/proc`
+had to be mounted after the detach *so that it would be the sandbox's process
+table*, was wrong about its own reason while producing the right result.
+`TestProcIsTheSandboxProcessTable` passes under the new order, which is the
+only evidence that matters.
+
+**Lesson.** `EPERM` from `mount(2)` is not necessarily about privilege. The
+mount API reports every refusal that way, including the visibility rules that
+exist only inside a user namespace, and reading it as "the process lost a
+capability" sends you to rewrite the part of the change that was correct.
