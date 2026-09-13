@@ -20,7 +20,9 @@ import (
 // command at PID 1.
 //
 // Not here yet: CLONE_NEWUSER (the sandbox runs as real root, so a container
-// root is host root — Phase 1), CLONE_NEWCGROUP, and seccomp.
+// root is host root — Phase 1) and CLONE_NEWCGROUP. The seccomp filter is not
+// a clone flag: it is installed by the child on itself, last, once the
+// setup syscalls it denies are no longer needed. See seccomp_linux.go.
 const namespaces = syscall.CLONE_NEWNS | // mount:   its own filesystem tree
 	syscall.CLONE_NEWUTS | // uts:     its own hostname
 	syscall.CLONE_NEWIPC | // ipc:     no shared memory or message queues
@@ -191,7 +193,10 @@ func MaybeChild() {
 //     than the host's process table;
 //  5. mount a tmpfs /dev and make the standard nodes on it, so a build that
 //     opens /dev/null does not instead create a file of that name in the
-//     shared rootfs image.
+//     shared rootfs image;
+//  6. install the seccomp filter last of all, since every step above uses
+//     syscalls it denies — and after the command has been resolved, because
+//     that walks PATH and the filter has no reason to be in force for it.
 func child() error {
 	rootfs := os.Getenv(envRootfs)
 	if rootfs == "" {
@@ -255,6 +260,10 @@ func child() error {
 	path, err := exec.LookPath(argv[0])
 	if err != nil {
 		return fmt.Errorf("sandbox: %w", err)
+	}
+
+	if err := applySeccomp(); err != nil {
+		return err
 	}
 	return syscall.Exec(path, argv, []string{"PATH=" + sandboxPATH, "HOME=/root"})
 }

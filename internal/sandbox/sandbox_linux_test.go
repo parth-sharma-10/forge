@@ -535,3 +535,94 @@ func TestInvalidLimitsAreRejectedBeforeAnythingRuns(t *testing.T) {
 		t.Fatalf("err = %v, want a validation error naming the negative limit", err)
 	}
 }
+
+// TestSeccompFilterSurvivesExec reads the kernel's own account of the build
+// command's state. seccomp_linux_test.go proves what the filter would decide;
+// this proves the filter is loaded, in filter mode, on the process that
+// matters — the exec'd busybox, not the Go child that installed it.
+func TestSeccompFilterSurvivesExec(t *testing.T) {
+	out, err := sh(t, "awk '/^Seccomp:|^Seccomp_filters:|^NoNewPrivs:/ {print $1 $2}' /proc/self/status")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	// Mode 2 is SECCOMP_MODE_FILTER; exactly one filter, because a second
+	// would mean the child installed it twice. The order is the kernel's, in
+	// fs/proc/array.c — NoNewPrivs is printed before the seccomp fields.
+	want := "NoNewPrivs:1\nSeccomp:2\nSeccomp_filters:1"
+	if out != want {
+		t.Fatalf("/proc/self/status = %q, want %q", out, want)
+	}
+}
+
+// TestSeccompDeniesMknod is the syscall the private /dev deliberately does not
+// bound: sandbox root keeps CAP_MKNOD, so until there is a filter, a build can
+// make itself a block device for the host's disk. The rootfs is bind-mounted
+// and shared between builds, so a failure here writes into the image every
+// later build starts from — hence the cleanup on both sides.
+func TestSeccompDeniesMknod(t *testing.T) {
+	dir := rootfs(t)
+	const probe = "/tmp/forge-seccomp-probe"
+	t.Cleanup(func() {
+		// The script below removes this itself, but only if the sandbox got
+		// far enough to run it.
+		if err := os.Remove(filepath.Join(dir, strings.TrimPrefix(probe, "/"))); err == nil {
+			t.Errorf("%s was left in the rootfs image: mknod was not denied", probe)
+		}
+	})
+
+	out, err := sh(t, "mknod "+probe+" c 1 3 2>/dev/null && echo made || echo denied; "+
+		"test -e "+probe+" && echo present || echo absent; rm -f "+probe)
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if want := "denied\nabsent"; out != want {
+		t.Fatalf("mknod inside the sandbox = %q, want %q", out, want)
+	}
+}
+
+// TestSeccompDeniesMount covers the other half: a build that can mount can
+// bring the host's filesystem back into a root the sandbox spent five steps
+// getting rid of.
+func TestSeccompDeniesMount(t *testing.T) {
+	out, err := sh(t, "mount -t tmpfs none /mnt 2>/dev/null && echo mounted || echo denied")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "denied" {
+		t.Fatalf("mount inside the sandbox = %q, want denied", out)
+	}
+}
+
+// TestAnOrdinaryBuildIsUnaffected is the other direction, and the one an
+// allowlist gets wrong: a filter that denies too much passes every test above
+// and breaks every real build. The script is deliberately mundane — files,
+// pipes, a subshell, an archive, an in-place edit, a read of /dev/urandom —
+// and `set -e` makes any step that hits a denied syscall fail the test.
+func TestAnOrdinaryBuildIsUnaffected(t *testing.T) {
+	const script = `set -e
+mkdir -p /tmp/forge-build && cd /tmp/forge-build
+for i in 1 2 3; do echo line-$i > f$i; done
+cat f1 f2 f3 | sort -r | head -1
+dd if=/dev/urandom of=r bs=1k count=4 2>/dev/null && echo random-read
+ln -s f1 link && readlink link
+chmod 600 f1
+tar cf a.tar f1 f2 f3 && rm -f f1 f2 f3 && tar xf a.tar && cat f2
+sed -i 's/line/LINE/' f3 && cat f3
+( echo sub > bg ) &
+wait
+cat bg
+ls f1 f2 f3
+cd / && rm -rf /tmp/forge-build`
+
+	dir := rootfs(t)
+	t.Cleanup(func() { os.RemoveAll(filepath.Join(dir, "tmp/forge-build")) })
+
+	out, err := sh(t, script)
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	want := "line-3\nrandom-read\nf1\nline-2\nLINE-3\nsub\nf1\nf2\nf3"
+	if out != want {
+		t.Fatalf("build output =\n%q\nwant\n%q", out, want)
+	}
+}

@@ -435,3 +435,55 @@ is a harness reporting on its own debris.
 
 A test that asserts external state is clean has to leave it clean when it
 fails. Otherwise its first failure is the only honest one.
+
+## 2026-09-11 — A denial test that passed when everything was allowed
+
+**Problem.** The mutation that redefines the filter's deny action as
+`SECCOMP_RET_ALLOW` — the one that turns the whole filter into a no-op — left
+`TestFilterDeniesTheKernelFacingSurface` green. That test exists for exactly
+that mutation.
+
+**Symptoms.** `CAUGHT unlisted-syscalls-allowed: ['TestDenialIsENOSYS',
+'TestSeccompDeniesMknod', 'TestSeccompDeniesMount']`. Three tests caught it and
+the one named after it did not.
+
+**Root cause.** The assertion was `got != denyAction`, and `denyAction` is the
+constant the mutation changes. The test asked "does `mount` get the deny
+action" and the mutation had made the deny action "allow", so it did, and the
+test agreed. Self-consistent and worthless — the same shape as an allowlist
+test that iterates the allowlist, which passes just as happily on an empty one.
+
+**Fix.** Assert against `retAllow` as well: `mount` must not be allowed,
+whatever the policy constant currently says. The mutation is now caught by the
+test that is supposed to catch it.
+
+**Lesson.** A test that compares behaviour against the constant that defines
+the behaviour tests nothing. At least one assertion has to name the outcome
+literally. It survived review because the tautology is invisible when both
+halves read correctly — only the mutation batch made it visible, by changing
+the constant and watching the test agree.
+
+## 2026-09-11 — TSYNC is right, and no test can tell
+
+**Problem.** The mutation that clears `SECCOMP_FILTER_FLAG_TSYNC` — filtering
+only the calling thread instead of every thread of the process — was the one
+mutation of eleven the suite missed. The full suite passed with it applied.
+
+**Symptoms.** `MISSED no-tsync: suite passed`, on every run.
+
+**Root cause.** Not a gap in the tests. `seccomp(2)` without TSYNC applies the
+filter to the calling thread; Go may move a goroutine to a different OS thread
+at any call, so the thread that installs the filter is not guaranteed to be the
+thread that reaches `execve` — and a filter that was installed on some other
+thread is simply not there afterwards. But nothing in the child between the
+install and the `execve` gives the runtime a reason to migrate, so in practice
+it never does, and the flag's absence is invisible until the day it isn't.
+
+**Fix.** None. TSYNC stays, and the reason it stays is written in the code
+rather than defended by a test.
+
+**Lesson.** Recorded rather than papered over: 10/11 with a named, understood
+miss is a more honest number than 11/11 bought with a test that reruns the
+child a thousand times hoping to catch a scheduler. A mutation that survives
+because the hazard it creates is rare is still a real hazard — the mutation
+score measures the tests, and here the tests are as good as they can be.

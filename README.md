@@ -5,9 +5,9 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phase 0, Week 3 of 5 phases.** What exists today is the bounded worker
-pool, the sandbox's namespace isolation and private device filesystem, and
-per-job cgroups v2 resource limits. The API, the queue and everything
+**Status: Phase 0, Week 4 of 5 phases.** What exists today is the bounded worker
+pool, the sandbox's namespace isolation and private device filesystem, per-job
+cgroups v2 resource limits, and a deny-by-default seccomp filter. The API, the queue and everything
 distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented and [docs/decisions.md](docs/decisions.md) for why.
 
@@ -131,7 +131,7 @@ cmd/forge-worker   job executor                  (pool driver today)
 cmd/forged         sandbox runtime               implemented
 internal/pool      bounded worker pool           implemented
 internal/sandbox   namespaces, pivot_root, /dev  implemented
-                   seccomp                       (not built yet)
+                   seccomp allowlist             implemented
 internal/cgroup    cgroups v2 memory/cpu/pids    implemented
 internal/queue     PostgreSQL queue, leases      (not built yet)
 internal/cas       content-addressed storage     (not built yet)
@@ -149,15 +149,22 @@ through `make vm-test` against a colima VM.
 
 ## Limitations
 
-The sandbox isolates against *accident*, not against a hostile build. There is
-no user namespace yet, so root inside the sandbox is root on the host, and no
-seccomp filter, so the full syscall surface is reachable.
+The sandbox isolates against *accident*, and against a hostile build only as
+far as the syscall filter reaches. There is no user namespace yet, so root
+inside the sandbox is root on the host.
+
+The seccomp filter is an allowlist of syscall *numbers*; it never looks at
+arguments. `clone` has to be allowed for a build to fork at all, so its flags
+are unbounded and a build can still create namespaces of its own. An unlisted
+syscall returns `ENOSYS`, which is what lets a C library fall back to an older
+call rather than fail outright — and which makes a denial read like an old
+kernel in a build log rather than like a denial.
 
 The `/dev` the sandbox provides is six nodes and four symlinks, and nothing
 else. A build that wants a pty or POSIX shared memory (`/dev/ptmx`,
-`/dev/shm`) does not get one yet. Making device nodes is also not blocked —
-sandbox root has `CAP_MKNOD` — so the private `/dev` keeps builds working, it
-does not contain a hostile one; that is the user namespace's job.
+`/dev/shm`) does not get one yet. Making new device nodes is now denied by the
+filter rather than by capabilities: sandbox root still holds `CAP_MKNOD`, and
+gets `ENOSYS` from `mknod` regardless.
 
 There is also still no API, no persistence, and no benchmark numbers — and none
 will be quoted here until a harness produces them.

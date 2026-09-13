@@ -1,8 +1,8 @@
 # Forge — architecture
 
-Status: **Phase 0, Week 3.** The bounded worker pool, the sandbox's namespace
-isolation with a private device filesystem, and per-job cgroups v2 resource
-limits exist. This document describes the target shape and is
+Status: **Phase 0, Week 4.** The bounded worker pool, the sandbox's namespace
+isolation with a private device filesystem, per-job cgroups v2 resource limits
+and a deny-by-default seccomp filter exist. This document describes the target shape and is
 updated as each milestone lands; anything not marked *implemented* is not built
 yet.
 
@@ -119,10 +119,9 @@ the tmpfs, both are correct and neither outlives the mount namespace, so there
 is no cleanup path to get wrong.
 
 **Not isolated yet**, and named as such in the README rather than implied away:
-no user namespace (sandbox root *is* host root, and keeps `CAP_MKNOD`, so a
-hostile build can still make its own device nodes), no seccomp filter, and no
-network interface at all. Resource limits landed in Week 3; the rest is
-Phase 1.
+no user namespace, so sandbox root *is* host root and keeps every capability
+it was given, and no network interface at all. Resource limits landed in Week
+3 and the syscall filter in Week 4; the user namespace is Phase 1.
 
 Tests live behind `//go:build linux` and need `CAP_SYS_ADMIN` plus an unpacked
 rootfs; `make test-sandbox` on Linux, `make vm-test` from macOS via colima, and
@@ -176,11 +175,57 @@ cgroup that is never removed is a kernel object leaked once per build.
 delegated subtree and must stay inside it; passing that path is the whole
 adaptation. The default is `/sys/fs/cgroup/forge`.
 
+### internal/sandbox — the seccomp filter (implemented, Week 4)
+
+A classic BPF program, installed by the child on itself as the last thing
+before `execve` and inherited across it. The kernel runs it on every syscall
+against a `struct seccomp_data`; this one reads two fields of that struct and
+nothing else.
+
+**An allowlist, not a blocklist.** The filter names the syscalls a build is
+expected to need — 157 that exist on every architecture Forge builds for, plus
+that architecture's own (192 in total on amd64, 159 on arm64, which has no
+legacy `open`/`stat`/`fork` forms) — and denies everything else — so a syscall a future kernel
+adds is denied by never having been listed, rather than by someone remembering
+to add it to a blocklist. `mount`, `pivot_root`, `mknod`, `ptrace`, `bpf`,
+`init_module`, `kexec_load`, `keyctl`, `perf_event_open`, `unshare` and the
+rest of the kernel-facing surface are absent from the list and appear nowhere
+in the implementation.
+
+**Denials return `ENOSYS`, not `EPERM`.** See docs/decisions.md; the short
+version is that `ENOSYS` is the one errno a C library treats as "fall back to
+the older syscall", so an allowlist that returns anything else breaks every
+program built against a newer libc than the list.
+
+**Ordering.** Installed after the mounts, because building the sandbox uses
+the syscalls the sandbox must not have — `mount`, `pivot_root` and `mknod` are
+simultaneously what a build must not reach and what putting a build behind
+this boundary requires. And after `exec.LookPath`, which walks `PATH` and has
+no reason to run under the filter.
+
+**Two details that are not incidental:**
+
+- *The architecture is checked before the number.* Under the x32 or i386 ABI
+  the same numbers name different syscalls, so a filter that compares numbers
+  without pinning `seccomp_data.arch` is checking the wrong table. A
+  mismatched ABI is killed, not denied: it is not something a build does by
+  accident.
+- *`SECCOMP_FILTER_FLAG_TSYNC`.* Go moves goroutines between OS threads, and
+  `seccomp(2)` without TSYNC filters only the calling thread — so the thread
+  that installs the filter is not guaranteed to be the thread that reaches the
+  `execve`. TSYNC applies it to every thread of the process.
+
+Syscall numbers come from Go's own `syscall` package, which resolves them per
+architecture at compile time. The handful that package's frozen Linux tables
+omit — `seccomp` and `getrandom` on amd64 — are written out in
+`seccomp_linux_amd64.go`, beside the audit token for that architecture. An
+architecture with no such file is a compile error rather than a filter built
+from another architecture's numbers.
+
 ## Next
 
-Phase 0 Week 4 — seccomp: a syscall filter applied after the sandbox is built
-and before the build command is exec'd, denying by default rather than listing
-what to block. It is also what would bound `mknod`, which the private `/dev`
-deliberately does not. Then the user namespace that makes sandbox root stop being host
-root, which is the change that turns this from a boundary against accident into
-one against a hostile build.
+Phase 0 Week 5 — the user namespace that makes sandbox root stop being host
+root, which is the change that turns this from a boundary against accident
+into one against a hostile build. It is also what makes `no_new_privs`, set
+here already, load-bearing, and what would bound `clone`'s flags in a way the
+number-only filter cannot.

@@ -263,6 +263,58 @@ absence gives `ENOENT`, which some read as "broken system" rather than "no tty".
 write. Bounding that is the user namespace's job, not this change's; what this
 change fixes is builds failing by accident.
 
+## 2026-09-11 — The seccomp filter is an allowlist, written as BPF by hand
+
+An allowlist of about 190 syscall numbers, denying everything else, rather than
+a blocklist of the dangerous ones.
+
+Rejected: a blocklist, which is what Docker's default profile is. A blocklist
+is smaller and easier to read, and it is wrong by construction — every syscall
+a future kernel adds is permitted until someone notices it. `openat2` and
+`clone3` are both recent enough that a blocklist written three years ago misses
+them. The allowlist's cost is real and is the opposite failure: a syscall a
+build legitimately needs and nobody listed. That failure is loud, local and
+fixed by one line; the blocklist's failure is silent.
+
+Rejected: `libseccomp-golang`. It is the standard tool and it is cgo, which
+would put a C toolchain and a shared library between Forge and a static binary,
+for a program that is nineteen instructions of encoding. See "Zero dependencies
+until one is unavoidable" — this one is avoidable.
+
+Syscall numbers come from Go's own `syscall` package, which resolves them per
+architecture at compile time, so the policy is written once as names. Go froze
+its Linux tables before `seccomp` and `getrandom` existed on amd64; those two
+numbers are written out in `seccomp_linux_amd64.go` and are the only magic
+numbers in the package. `golang.org/x/sys/unix` would supply them, and would
+be the right answer the moment a third is needed.
+
+## 2026-09-11 — A denied syscall returns ENOSYS, not EPERM
+
+`SECCOMP_RET_ERRNO(ENOSYS)` for everything not on the allowlist.
+
+Why: `ENOSYS` is the one errno a C library treats as "this kernel is older than
+I am, use the fallback". glibc issues `clone3` and drops back to `clone` on
+`ENOSYS`; it issues `statx` and drops back to `fstatat`. On `EPERM` it does
+neither — it propagates the failure. So an allowlist returning `EPERM` breaks
+every program built against a libc newer than the list, as an unexplained
+failure deep inside a build, and it breaks them *because* the list is an
+allowlist. `ENOSYS` makes the allowlist self-healing against exactly the case
+it is worst at.
+
+This is also why the allowlist can stay as small as it is: `statx`, `openat2`,
+`clone3`, `close_range`, `faccessat2` and `rseq` are all absent, and libc falls
+back for each.
+
+Rejected: `EPERM`, which is Docker's default and is right for a boundary whose
+denials get audited. Rejected: `SECCOMP_RET_KILL_PROCESS`, which is the only
+option that makes a denial unmissable — a build dies with `SIGSYS` and the
+kernel logs the syscall number. That is the correct choice for a hostile
+workload and the wrong one here, where the filter's first job is to stop
+accidents without turning every unlisted syscall into a build failure.
+
+The cost, stated plainly: in a build log a denial is indistinguishable from an
+old kernel. Changing it is one constant in `seccomp_linux.go`.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that
