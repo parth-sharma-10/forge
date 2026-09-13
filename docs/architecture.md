@@ -73,22 +73,30 @@ the child path.
 ```
 forge-worker (or forged, or the test binary)
      |
-     | clone(CLONE_NEWNS|NEWUTS|NEWIPC|NEWPID|NEWNET), Pdeathsig=SIGKILL
+     | clone(CLONE_NEWUSER|NEWNS|NEWUTS|NEWIPC|NEWPID|NEWNET), Pdeathsig=SIGKILL
+     |   uid/gid map 0..65535 -> 524288.., then setgid(0)/setuid(0)
      v
-/proc/self/exe forge-sandbox-child <argv...>
+/proc/self/exe forge-sandbox-child <argv...>   root inside, uid 524288 outside
      |  sethostname
      |  mount(/, MS_REC|MS_PRIVATE)      nothing propagates back to the host
      |  mount(rootfs, rootfs, MS_BIND)   pivot_root needs a mount point
-     |  pivot_root(rootfs, .forge-oldroot)
-     |  umount2(old, MNT_DETACH); rmdir  no mount left to walk back to
-     |  mount(proc, /proc)               the new PID namespace's process table
-     |  mount(tmpfs, /dev) + mknod x6    six devices, and nothing else
+     |  mount(proc, rootfs/proc)         the new PID namespace's process table
+     |  mount(tmpfs, rootfs/dev)         + six bind mounts from the host's /dev
+     |  pivot_root(".", ".")             the old root parks on top of the new
+     |  umount2(".", MNT_DETACH)         no mount left to walk back to
      v
 execve(build command)                    PID 1 of its own namespace
 ```
 
+Both mounts happen before `pivot_root`, and neither is free to move: the
+device nodes are bind mounts of the host's, which after `pivot_root` is not a
+path any more, and a fresh `proc` may only be mounted from a user namespace
+while a fully visible `proc` is still in the mount namespace — which the detach
+of the old root takes away. See `docs/failures.md`, 2026-09-11.
+
 | Namespace | What it costs an escaping build |
 |---|---|
+| user | Its root is host uid 524288: it owns nothing on the host and its capabilities stop at the namespace's edge. |
 | mount | No path to the host filesystem; mounts it makes die with it. |
 | uts | Its own hostname; cannot rename the node. |
 | ipc | No shared memory or message queues with anything on the host. |
@@ -103,12 +111,16 @@ a worker that dies mid-build does not leave the build running.
 Exit status 125 distinguishes "the sandbox could not be built" from the build
 command's own status, which is otherwise passed through untouched.
 
-**A private `/dev`.** The sandbox mounts a tmpfs on `/dev` and creates six
+**A private `/dev`.** The sandbox mounts a tmpfs on `/dev` and puts six
 character devices on it — `null`, `zero`, `full`, `random`, `urandom`, `tty` —
-plus `fd`, `stdin`, `stdout` and `stderr` as symlinks into its own `/proc`. The
-host's `/dev` is never consulted: the nodes are made from the major and minor
-numbers in the kernel's device registry, so the set is exactly what the code
-lists and nothing depends on what the host happens to have.
+plus `fd`, `stdin`, `stdout` and `stderr` as symlinks into its own `/proc`.
+Each node is a bind mount of the host's, because a process in a user namespace
+cannot create a device node at all: `mknod` for a character device wants
+`CAP_MKNOD` in the *initial* namespace, which is the one privilege the sandbox
+has given up. The major and minor numbers from the kernel's device registry are
+still in the code, now as an assertion — `/dev/null` is bound in only after the
+host's is confirmed to be character device 1:3. What has not changed is that
+the host's `/dev` is never mounted in wholesale; the set is exactly those six.
 
 The tmpfs is what makes it correct rather than merely present. The rootfs is
 bind-mounted and shared by every build on the worker, so without a mount over
@@ -118,10 +130,21 @@ Reads (`/dev/urandom`) failed loudly; writes succeeded and contaminated. With
 the tmpfs, both are correct and neither outlives the mount namespace, so there
 is no cleanup path to get wrong.
 
+**Sandbox root is not host root.** `CLONE_NEWUSER` maps uid and gid 0..65535
+inside to 524288..589823 outside, and `Credential` moves the child onto the
+first of them — the map alone would be decoration, since a child cloned from
+root keeps the root it was cloned with. The build still sees itself as uid 0
+and still holds `CAP_SYS_ADMIN` *in its own namespaces*, which is what lets it
+mount and `pivot_root`; on the host's side of the boundary it owns nothing. A
+consequence worth stating: the rootfs image belongs to host root, which the map
+does not cover, so the image is no longer writable from inside — `/tmp` is
+world-writable and is the only part a build can still contaminate.
+
 **Not isolated yet**, and named as such in the README rather than implied away:
-no user namespace, so sandbox root *is* host root and keeps every capability
-it was given, and no network interface at all. Resource limits landed in Week
-3 and the syscall filter in Week 4; the user namespace is Phase 1.
+every job on a worker shares one map, so this is a boundary between a build and
+the host rather than between two builds, and there is no network interface at
+all. Resource limits landed in Week 3, the syscall filter in Week 4, the user
+namespace in Week 5.
 
 Tests live behind `//go:build linux` and need `CAP_SYS_ADMIN` plus an unpacked
 rootfs; `make test-sandbox` on Linux, `make vm-test` from macOS via colima, and
@@ -198,7 +221,7 @@ the older syscall", so an allowlist that returns anything else breaks every
 program built against a newer libc than the list.
 
 **Ordering.** Installed after the mounts, because building the sandbox uses
-the syscalls the sandbox must not have — `mount`, `pivot_root` and `mknod` are
+the syscalls the sandbox must not have — `mount` and `pivot_root` are
 simultaneously what a build must not reach and what putting a build behind
 this boundary requires. And after `exec.LookPath`, which walks `PATH` and has
 no reason to run under the filter.
@@ -224,8 +247,10 @@ from another architecture's numbers.
 
 ## Next
 
-Phase 0 Week 5 — the user namespace that makes sandbox root stop being host
-root, which is the change that turns this from a boundary against accident
-into one against a hostile build. It is also what makes `no_new_privs`, set
-here already, load-bearing, and what would bound `clone`'s flags in a way the
-number-only filter cannot.
+Phase 0's five named weeks are done: the worker pool, the sandbox, cgroup
+limits, the private `/dev`, the seccomp filter and the user namespace. What is
+still open is written down rather than implied — a per-job rootfs, so `/tmp` is
+not shared between builds and one map is not shared by every job on a worker;
+argument filtering for `clone`, whose flags the number-only filter cannot
+bound; and a definition of done for Phase 0 itself, which has never been
+written and should be before Phase 1 starts.
