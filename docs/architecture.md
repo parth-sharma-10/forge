@@ -1,10 +1,11 @@
 # Forge — architecture
 
-Status: **Phase 0, Week 4.** The bounded worker pool, the sandbox's namespace
-isolation with a private device filesystem, per-job cgroups v2 resource limits
-and a deny-by-default seccomp filter exist. This document describes the target shape and is
-updated as each milestone lands; anything not marked *implemented* is not built
-yet.
+Status: **Phase 0 complete** — see [phase-0.md](phase-0.md) for what that
+means and how it is checked. The bounded worker pool, the sandbox's namespace
+isolation with a private device filesystem, per-job cgroups v2 resource limits,
+a deny-by-default seccomp filter and the user namespace exist. This document
+describes the target shape and is updated as each milestone lands; anything
+not marked *implemented* is not built yet.
 
 ## Target shape
 
@@ -252,5 +253,5 @@ limits, the private `/dev`, the seccomp filter and the user namespace. What is
 still open is written down rather than implied — a per-job rootfs, so `/tmp` is
 not shared between builds and one map is not shared by every job on a worker;
 argument filtering for `clone`, whose flags the number-only filter cannot
-bound; and a definition of done for Phase 0 itself, which has never been
-written and should be before Phase 1 starts.
+bound; and the capability bounding set. [phase-0.md](phase-0.md) is the
+definition of done and carries that list.

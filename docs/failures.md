@@ -541,3 +541,35 @@ only evidence that matters.
 mount API reports every refusal that way, including the visibility rules that
 exist only inside a user namespace, and reading it as "the process lost a
 capability" sends you to rewrite the part of the change that was correct.
+
+---
+
+## 2026-09-15 — A mutation went from caught to missed without anyone touching the test
+
+**Problem.** Moving the three mutation harnesses into the repo as one
+`hack/mutate.py` and running the merged batch scored 22 of 24. `nodev-flag-set`
+— add `MS_NODEV` to the `/dev` tmpfs — had been caught in Week 2 and now passed
+the whole suite. Nothing in the tests had changed.
+
+**Root cause.** The code under the test had. In Week 2 the six nodes were made
+with `mknod` *on* the tmpfs, so `MS_NODEV` on that mount made every one of them
+inert and `TestDevNodesBehaveLikeTheirKernelDevices` failed. Week 5 turned them
+into bind mounts of the host's nodes, and a bind mount carries its source
+mount's flags, not its parent's — the tmpfs's `MS_NODEV` no longer reached
+anything. The decision entry saying the mount "is not `MS_NODEV`" because
+"carrying six of them is this filesystem's entire purpose" had been false for
+four days, and the comment in the code with it.
+
+**Fix.** Set the flag, since it now costs nothing and closes the only case it
+ever governed; amend the decision in place; retire the mutation, because a flag
+with no observable effect has no test that can pin it. `no-tsync` was retired
+in the same pass for the opposite reason — the property is real but which
+thread reaches `execve` is the scheduler's choice, so no test can fail on it
+deterministically. `make mutate` now exits non-zero on any miss, which it could
+not while carrying a mutation that was expected to be missed.
+
+**Lesson.** A mutation score is a claim about the tests *and* the code at one
+commit; a change elsewhere can turn a caught mutation into an equivalent one
+without touching either the test or the score anyone remembers. That is the
+argument for the harness living in the repo and running from `make`, rather
+than in a cache directory where it is run when someone thinks of it.
