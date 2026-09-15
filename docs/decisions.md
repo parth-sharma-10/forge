@@ -256,6 +256,12 @@ Two details that are not incidental:
 - **The mount is not `MS_NODEV`.** That flag makes device nodes on a filesystem
   inert, and carrying six of them is this filesystem's entire purpose. It is
   `nosuid,noexec`, which costs nothing here.
+
+  *Amended 2026-09-15:* it is `MS_NODEV` now. Once the nodes became bind mounts
+  (Week 5), each carried the host mount's flags and the tmpfs's stopped
+  reaching them — the mutation harness found the flag had become a no-op, the
+  suite passing with it set. Set, it costs nothing and closes the one thing it
+  ever governed: a device node created on the tmpfs itself.
 - **The umask is zeroed around the `mknod` calls.** `mknod` masks its mode the
   way `open` does, so an inherited 022 leaves `/dev/null` at 0644 — which works
   for exactly as long as every build runs as root, i.e. until the user

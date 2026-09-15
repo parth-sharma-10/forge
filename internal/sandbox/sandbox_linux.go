@@ -205,11 +205,11 @@ func mountDev(rootfs string) error {
 	if err := os.MkdirAll(dev, 0o755); err != nil {
 		return fmt.Errorf("sandbox: %w", err)
 	}
-	// Not MS_NODEV, which would make every node below inert — that flag is
-	// for filesystems that have no business carrying devices, and this one's
-	// entire purpose is to carry six of them. 64k is room for the mount points
-	// and the symlinks and nothing else.
-	const devFlags = syscall.MS_NOSUID | syscall.MS_NOEXEC
+	// MS_NODEV is safe here since the nodes became bind mounts: each carries
+	// the host mount's own flags, so the tmpfs's flags never reach them. It
+	// only bites a device node created *on* the tmpfs, which nothing can do.
+	// 64k is room for the mount points and the symlinks and nothing else.
+	const devFlags = syscall.MS_NOSUID | syscall.MS_NOEXEC | syscall.MS_NODEV
 	if err := syscall.Mount("tmpfs", dev, "tmpfs", devFlags, "mode=0755,size=64k"); err != nil {
 		return fmt.Errorf("sandbox: mount %s: %w", dev, err)
 	}
