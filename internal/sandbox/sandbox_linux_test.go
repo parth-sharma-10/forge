@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -144,12 +145,16 @@ func TestHostFilesystemIsUnreachable(t *testing.T) {
 	marker.Close()
 	defer os.Remove(marker.Name())
 
-	out, err := sh(t, "test -e "+marker.Name()+" && echo VISIBLE || echo HIDDEN; test -e /"+oldRootDir+" && echo OLDROOT || echo DETACHED")
+	// This is also the assertion behind detaching the old root. pivot_root
+	// parks it stacked over the new one, so a missing unmount does not leave a
+	// directory to look for — it leaves the sandbox looking at the host's
+	// filesystem as /, and the marker visible.
+	out, err := sh(t, "test -e "+marker.Name()+" && echo VISIBLE || echo HIDDEN")
 	if err != nil {
 		t.Fatalf("run: %v (output %q)", err, out)
 	}
-	if want := "HIDDEN\nDETACHED"; out != want {
-		t.Fatalf("got %q, want %q: the host root is still reachable from inside", out, want)
+	if out != "HIDDEN" {
+		t.Fatalf("got %q, want HIDDEN: the host root is still reachable from inside", out)
 	}
 }
 
@@ -239,10 +244,11 @@ func TestDevNodesBehaveLikeTheirKernelDevices(t *testing.T) {
 	}
 }
 
-// TestDevNodesAreWritableByAnyone is the assertion behind zeroing the umask
-// before mknod. Without it the inherited 022 leaves /dev/null at 0644, which
-// works for exactly as long as every build runs as root — that is, until the
-// user namespace lands and the failure looks like something else entirely.
+// TestDevNodesAreWritableByAnyone fails if the nodes ever stop being bind
+// mounts of the host's. A bind presents the source inode, so /dev/null is 0666
+// because the host's is; anything that recreated these as files on the tmpfs
+// would present that file's mode instead, and work for exactly as long as every
+// build runs as uid 0 inside.
 func TestDevNodesAreWritableByAnyone(t *testing.T) {
 	out, err := sh(t, "ls -l /dev/null | cut -c1-10")
 	if err != nil {
@@ -624,5 +630,103 @@ cd / && rm -rf /tmp/forge-build`
 	want := "line-3\nrandom-read\nf1\nline-2\nLINE-3\nsub\nf1\nf2\nf3"
 	if out != want {
 		t.Fatalf("build output =\n%q\nwant\n%q", out, want)
+	}
+}
+
+// TestSandboxRootIsAnUnprivilegedHostUid is what the user namespace is for: the
+// build believes it is root and the kernel disagrees. The second file is the
+// assertion behind mapping a range rather than the single id the build runs as
+// — a package manager that chowns is the ordinary case, not an exotic one.
+func TestSandboxRootIsAnUnprivilegedHostUid(t *testing.T) {
+	dir := rootfs(t)
+	probe := filepath.Join(dir, "tmp/forge-userns")
+	t.Cleanup(func() { os.RemoveAll(probe) })
+
+	out, err := sh(t, "set -e; mkdir -p /tmp/forge-userns; cd /tmp/forge-userns; "+
+		"touch mine theirs; chown 1000:1000 theirs; id -u")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "0" {
+		t.Fatalf("uid inside sandbox = %q, want 0", out)
+	}
+
+	for _, c := range []struct {
+		file   string
+		inside uint32
+	}{{"mine", 0}, {"theirs", 1000}} {
+		var st syscall.Stat_t
+		if err := syscall.Stat(filepath.Join(probe, c.file), &st); err != nil {
+			t.Fatal(err)
+		}
+		want := uint32(mappedBase) + c.inside
+		if st.Uid != want || st.Gid != want {
+			t.Errorf("%s is owned by %d:%d on the host, want %d:%d — uid %d inside the sandbox is not mapped where the map says",
+				c.file, st.Uid, st.Gid, want, want, c.inside)
+		}
+		if st.Uid == 0 {
+			t.Errorf("%s is owned by host root: the build is still running as the real thing", c.file)
+		}
+	}
+}
+
+// TestSetgroupsIsDeniedInTheNamespace pins the one line of this change with no
+// visible effect on a build. A process that can call setgroups(2) inside the
+// namespace can drop a supplementary group, and dropping a group is how a
+// mapped uid gets past a directory that excludes it by negative permission.
+// The kernel records the decision where the sandbox itself can read it.
+func TestSetgroupsIsDeniedInTheNamespace(t *testing.T) {
+	out, err := sh(t, "cat /proc/self/setgroups")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "deny" {
+		t.Fatalf("setgroups is %q in the sandbox's user namespace, want deny", out)
+	}
+}
+
+// TestTheRootfsImageIsNotWritable is the other half of the same fact, from the
+// filesystem's side. The image belongs to host root, which the sandbox's map
+// does not cover, so being root inside buys nothing against it — CAP_DAC_OVERRIDE
+// only reaches files owned by a uid the namespace can name.
+//
+// It is also the first thing that stops one build contaminating the next
+// through the shared image. Only what is world-writable in the image — /tmp —
+// is still shared, and an overlay per job is what closes that.
+func TestTheRootfsImageIsNotWritable(t *testing.T) {
+	dir := rootfs(t)
+	leaked := filepath.Join(dir, "etc/forge-probe")
+	t.Cleanup(func() { os.Remove(leaked) })
+
+	out, err := sh(t, "touch /etc/forge-probe 2>/dev/null && echo WROTE || echo REFUSED")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "REFUSED" {
+		t.Fatalf("a build wrote into /etc of the shared rootfs image: %q", out)
+	}
+	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
+		t.Fatalf("%s exists on the host (stat: %v): the write was refused and happened anyway", leaked, err)
+	}
+}
+
+// TestHostRootHasNoIdentityInsideTheSandbox pins the direction of the map. Only
+// the 65536 ids starting at mappedBase are mapped, and host root is not among
+// them, so every file the image carries belongs to nobody as far as the sandbox
+// is concerned. A map that reached host uid 0 would undo the whole change while
+// leaving every other test above green.
+func TestHostRootHasNoIdentityInsideTheSandbox(t *testing.T) {
+	overflow, err := os.ReadFile("/proc/sys/kernel/overflowuid")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.TrimSpace(string(overflow))
+
+	out, err := sh(t, "stat -c %u /bin/busybox")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != want {
+		t.Fatalf("/bin/busybox is owned by uid %s inside the sandbox, want %s (the overflow uid): host root is mapped into the namespace", out, want)
 	}
 }

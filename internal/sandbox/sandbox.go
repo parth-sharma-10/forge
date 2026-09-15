@@ -56,10 +56,6 @@ const (
 	envRootfs   = "FORGE_SANDBOX_ROOTFS"
 	envHostname = "FORGE_SANDBOX_HOSTNAME"
 
-	// oldRootDir is where pivot_root parks the host root before it is
-	// detached. It lives inside the new root because pivot_root requires it.
-	oldRootDir = ".forge-oldroot"
-
 	defaultHostname = "forge"
 )
 

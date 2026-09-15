@@ -95,6 +95,12 @@ EBUSY), the detach before `/proc` is mounted (so `/proc` is the new PID
 namespace's process table rather than a copy of the host's). Each of those four
 steps has a mutation test behind it.
 
+*Amended 2026-09-11:* `/proc` is now mounted before `pivot_root`, not after the
+detach, and the reason given here for the old order was wrong — the instance is
+the new PID namespace's either way, because that is fixed by the namespace of
+the mounting process. The user namespace forced the change and `docs/failures.md`
+has the account.
+
 ## 2026-09-09 — No user namespace yet, so sandbox root is host root
 
 `CLONE_NEWUSER` is deliberately not in the set. Everything runs as real root,
@@ -111,6 +117,10 @@ target. It lands in Phase 1 as its own change, with the uid/gid mapping and the
 Until then the sandbox is an isolation boundary against *accident*, not against
 a hostile build. `README.md` says so, and it will keep saying so until the
 mapping is real.
+
+*Superseded 2026-09-11* — the mapping landed in Phase 0 Week 5 rather than
+Phase 1, after the primitives it changes the meaning of, which is the order
+this entry argued for. See below.
 
 ## 2026-09-09 — The rootfs is a pinned tarball, not `docker export`
 
@@ -314,6 +324,62 @@ accidents without turning every unlisted syscall into a build failure.
 
 The cost, stated plainly: in a build log a denial is indistinguishable from an
 old kernel. Changing it is one constant in `seccomp_linux.go`.
+
+## 2026-09-11 — Sandbox root is host uid 524288, and the map is 65536 wide
+
+`CLONE_NEWUSER` joins the clone flags, with uid and gid 0..65535 inside mapped
+to 524288..589823 outside, `setgroups` denied, and `Credential{Uid: 0, Gid: 0}`
+moving the child onto the first of them.
+
+Why the credential and not just the map: a child cloned from root keeps the
+host root it was cloned with, and the map only describes how ids are named
+inside the namespace. Without the `setuid` the process is still uid 0 to the
+kernel and the whole change is decoration that passes a test asserting `id -u`
+is 0 inside. This is the mutation the suite has to catch, and does.
+
+Dropping from root to another uid normally clears every capability, which would
+leave the child unable to mount anything a sandbox needs. It does not here: the
+kernel compares against root *of the process's own user namespace*, and 524288
+is exactly that, so the kernel reads this as a move to root rather than away
+from it. The child keeps `CAP_SYS_ADMIN` in its namespaces and holds nothing on
+the host.
+
+Why a range and not one id: a build that `chown`s is the ordinary case — every
+package manager does — and a single-id map answers all of them with EINVAL.
+65536 ids cost one constant.
+
+Why 524288: past every id a distribution assigns (systemd stops at 65535) and
+clear of 100000, where `/etc/subuid` starts handing 65536-id ranges to real
+users for rootless podman and docker. A collision is not a hole in the sandbox;
+it makes a build's files show up owned by somebody.
+
+Rejected: mapping host uid 0 into the namespace as some high id, which would
+keep the rootfs image writable from inside. It would also hand a build a
+capability-bearing path to files owned by the real root, which is the thing the
+map exists to remove.
+
+Two consequences, both real and neither papered over:
+
+- **The rootfs image is no longer writable from inside.** It belongs to host
+  root, which the map does not cover, and `CAP_DAC_OVERRIDE` only reaches files
+  owned by a uid the namespace can name. `/tmp` is world-writable in the image
+  and is the only part a build can still write — and still the only part one
+  build can contaminate for the next. A per-job overlay is what closes that.
+- **Every job on a worker shares one map**, so two builds on the same worker
+  run as the same host uid. This is a boundary between a build and the host,
+  not between two builds. Per-job ranges belong with the overlay.
+
+Two smaller observations from a real run, since both are easy to assume wrong:
+the build keeps a full capability set *inside* the namespace
+(`CapEff: 000001ffffffffff`) — the `setuid` does not strip it, for the reason
+above — and its one supplementary group is the overflow gid, host root's group
+seen through a map that does not cover it. `setgroups` being denied is what
+stops it trading that for a group that names something.
+
+The `/dev` nodes became bind mounts of the host's in the same change, because a
+process in a user namespace cannot create a device node at all — `CAP_MKNOD` is
+checked against the initial namespace. The kernel's major and minor numbers stay
+in the code as an assertion about the host rather than as arguments to `mknod`.
 
 ## Pending decisions
 
