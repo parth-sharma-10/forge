@@ -19,7 +19,7 @@ VM_GOARCH = $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 VM_TEST_BIN = $(HOME)/.cache/forge/sandbox.test
 VM_CGROUP_BIN = $(HOME)/.cache/forge/cgroup.test
 
-.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell
+.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate
 
 all: test
 
@@ -86,3 +86,9 @@ $(VM_CGROUP_BIN): $(wildcard internal/cgroup/*.go)
 
 vm-shell:
 	$(VM) ssh
+
+## mutate: break the sandbox one property at a time and check the tests notice
+# Runs inside the VM like vm-test. Exits non-zero on any mutation the suite
+# still passes; the score in docs/phase-0.md comes from this and nowhere else.
+mutate:
+	VM=$(VM) FORGE_TEST_ROOTFS=$(ROOTFS) hack/mutate.py
