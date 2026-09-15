@@ -5,7 +5,7 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phase 0, Week 5 of 5 phases.** What exists today is the bounded worker
+**Status: Phase 0 of 5 complete** ([docs/phase-0.md](docs/phase-0.md)). What exists today is the bounded worker
 pool, the sandbox's namespace isolation and private device filesystem, per-job
 cgroups v2 resource limits, a deny-by-default seccomp filter, and a user
 namespace that makes sandbox root an unprivileged uid on the host. The API, the
@@ -18,6 +18,7 @@ implemented and [docs/decisions.md](docs/decisions.md) for why.
 make test          # gofmt check, go vet, go test -race — everywhere
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
+make mutate        # break the sandbox 22 ways and check a test notices each
 ```
 
 ### The sandbox (Linux, as root)
