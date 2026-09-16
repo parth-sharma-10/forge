@@ -26,6 +26,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/parth-sharma-10/forge/internal/cgroup"
 )
@@ -97,6 +98,9 @@ func (s *Spec) validate() error {
 	}
 	if !filepath.IsAbs(s.Rootfs) {
 		return fmt.Errorf("sandbox: rootfs %q must be an absolute path", s.Rootfs)
+	}
+	if strings.ContainsAny(s.Rootfs, ",:") {
+		return fmt.Errorf("sandbox: rootfs %q: ',' and ':' are separators in overlay mount options", s.Rootfs)
 	}
 	fi, err := os.Stat(s.Rootfs)
 	if err != nil {

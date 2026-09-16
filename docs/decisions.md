@@ -387,6 +387,75 @@ process in a user namespace cannot create a device node at all — `CAP_MKNOD` i
 checked against the initial namespace. The kernel's major and minor numbers stay
 in the code as an assertion about the host rather than as arguments to `mknod`.
 
+## 2026-09-16 — Per-job root filesystem is an overlay the child mounts on a tmpfs
+
+Each job runs on an overlay: the image is the lower layer, and the upper and
+work directories are on a tmpfs the child mounts in its own mount namespace,
+over the image's own path, before `pivot_root`. Nothing is created on the
+host; the layer ends with the namespace.
+
+Why the child and not the parent: the parent would have to create a per-job
+directory on the host, pass it in, and remove it — and something would have to
+sweep the ones a crashed worker leaves. A mount in the job's namespace has no
+such path. Why the image path and not a directory of its own: any other mount
+point is a host path the sandbox would depend on existing and not containing
+the image; the image path is the one directory the sandbox already requires.
+The lower layer is named through the working directory so the tmpfs can cover
+the path without hiding the image from the mount that needs it.
+
+Rejected: a read-only bind of the image with tmpfs over `/tmp`, `/var/tmp` and
+`/root`. Smaller, but a build that installs a package writes to `/usr` and
+`/etc` and `/lib/apk`, and a build platform that cannot install build
+dependencies is not one. Deferred, not rejected: an upper layer on a host
+directory that outlives the job, which is what collecting artifacts from the
+filesystem would want. Nothing collects them yet.
+
+**The image is shifted into the uid map.** The kernel will not copy a file up
+whose owner is not mapped in the writer's user namespace — `ovl_copy_up_one`
+returns `EOVERFLOW` — and host root, which owned every file in the image, is
+the one id the map deliberately leaves out. Measured before it was reasoned
+about: the first run of the overlay failed `mkdir /tmp/x` with "Value too
+large for data type". `hack/shift-rootfs.sh` moves every uid and gid in the
+image up by `mappedBase`, once, at unpack; the test suite refuses an image
+that has not been shifted and says what to run.
+
+This gives up the Week 5 property that the image belongs to host root and is
+unwritable from inside at the permission level. What replaces it is stronger
+in the case that matters — the image is never the target of a write at all,
+because every write is a copy-up into the layer — and weaker in one that does
+not arise: a build that escaped its mount namespace would find the image
+owned by its own uid range. The alternative that keeps both, an idmapped bind
+mount of the lower layer, has to be made by the parent, against the child's
+user namespace, after the child exists, with `open_tree`, `mount_setattr` and
+`move_mount` and a hand-off in between. Not for a one-time `chown`.
+
+**No size on the tmpfs.** Its pages are charged to the job's cgroup, so
+`MemoryBytes` already bounds the layer; a separate limit would be a second
+number to explain that the first one covers. The kernel's default cap of half
+of RAM stands for a job with no limit.
+
+**`userxattr`, kept without a test that needs it.** The overlay marks a
+directory that hides its lower namesake with an extended attribute, and
+upstream `trusted.*` needs `CAP_SYS_ADMIN` in the initial namespace, which
+the mounter here does not have; `user.*` is the namespace the option
+switches to and the documented choice for an unprivileged mount. Measured:
+with the option removed, the suite passes on the colima VM's Ubuntu 6.8 —
+including a test that removes and recreates `/etc/apk/keys` and finds it
+empty — and `dmesg` shows none of the "failed to set xattr on upper" the
+fallback prints. So on that kernel the mounter sets `trusted.overlay.*` from
+inside the user namespace, which the upstream permission check does not
+allow and Ubuntu's overlayfs patches apparently do. The mutation
+`overlay-without-userxattr` is therefore not scored: a harness that fails on
+a mutant no kernel it runs on can distinguish is not a gate. The option stays
+because it costs nothing and is correct on the kernels that follow upstream.
+
+**Mutation `no-tmpfs-just-nodes` retired.** It dropped the tmpfs under `/dev`
+and was caught, in Phase 0, by device-node files leaking into the shared
+image. The overlay prevents that leak by itself, so the mutant became
+equivalent; per the 2026-09-15 rule it is retired rather than carried as an
+expected miss. The tmpfs stays: it still keeps the nodes out of the job's
+root filesystem, bounded to 64k and `noexec`.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that

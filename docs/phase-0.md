@@ -19,7 +19,7 @@ one is not done.
 | A `/dev` of six bind-mounted nodes and four symlinks, nothing else | `TestDevIsOnlyTheMinimalSet`, `TestDevNodesBehaveLikeTheirKernelDevices` |
 | cgroups v2 memory, cpu and pids limits, applied at clone time; an OOM kill is reported as one | `internal/cgroup`, `TestMemoryLimitIsReportedAsAnOOMKill`, `TestSandboxRunsInsideItsOwnCgroup` |
 | Deny-by-default seccomp allowlist, `ENOSYS` on denial, architecture checked before the number, `no_new_privs` | `TestSeccompDenies*`, `TestSeccompFilterSurvivesExec`, `seccomp_linux_test.go` |
-| Sandbox root is host uid 524288; the image is not writable from inside; `setgroups` denied | `TestSandboxRootIsAnUnprivilegedHostUid`, `TestTheRootfsImageIsNotWritable`, `TestSetgroupsIsDeniedInTheNamespace` |
+| Sandbox root is host uid 524288; the image is not writable from inside; `setgroups` denied | `TestSandboxRootIsAnUnprivilegedHostUid`, `TestTheRootfsImageIsNotWritable`, `TestSetgroupsIsDeniedInTheNamespace` — *the second became `TestTheImageIsNeverWritten` when the Phase 1 overlay made the image writable through a layer; the image itself is still never written* |
 | Exit 125 means "the sandbox failed to build", distinct from the command's own status | `TestExitStatusPropagates`, `spec_test.go` |
 | No third-party dependencies | `go.mod` has no `require` block |
 

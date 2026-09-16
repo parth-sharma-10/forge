@@ -5,11 +5,12 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phase 0 of 5 complete** ([docs/phase-0.md](docs/phase-0.md)). What exists today is the bounded worker
+**Status: Phase 0 of 5 complete** ([docs/phase-0.md](docs/phase-0.md)), Phase 1 in progress. What exists today is the bounded worker
 pool, the sandbox's namespace isolation and private device filesystem, per-job
-cgroups v2 resource limits, a deny-by-default seccomp filter, and a user
-namespace that makes sandbox root an unprivileged uid on the host. The API, the
-queue and everything distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
+cgroups v2 resource limits, a deny-by-default seccomp filter, a user
+namespace that makes sandbox root an unprivileged uid on the host, and a
+per-job overlay so each build gets its own writable root filesystem. The API,
+the queue and everything distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented and [docs/decisions.md](docs/decisions.md) for why.
 
 ## Quickstart
@@ -18,7 +19,7 @@ implemented and [docs/decisions.md](docs/decisions.md) for why.
 make test          # gofmt check, go vet, go test -race — everywhere
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
-make mutate        # break the sandbox 22 ways and check a test notices each
+make mutate        # break the sandbox 23 ways and check a test notices each
 ```
 
 ### The sandbox (Linux, as root)
@@ -111,29 +112,47 @@ every later build on the worker inherited.
 
 ### Sandbox root is not host root
 
-The build is uid 0 inside its user namespace and uid 524288 outside it. What it
-creates belongs to that uid on the host; what the rootfs image carries belongs
-to host root, which the namespace does not map, so from inside it reads as
-nobody.
+The build is uid 0 inside its user namespace and uid 524288 outside it. The
+image is shifted into that map by `make rootfs` (`hack/shift-rootfs.sh`), so
+from inside it belongs to root the way any container image does; host root
+itself is not mapped and reads as nobody.
 
 ```
 $ sudo /tmp/forged -rootfs /var/tmp/forge-rootfs -- /bin/sh -c \
-    'id; stat -c "%u %g %n" /bin/busybox; echo hi > /tmp/probe; stat -c "%u %g %n" /tmp/probe'
+    'id; cat /proc/self/uid_map; stat -c "%u %g %n" /bin/busybox'
 uid=0(root) gid=0(root) groups=65534(nobody)
-65534 65534 /bin/busybox
-0 0 /tmp/probe
-
-$ stat -c "%u %g %n" /var/tmp/forge-rootfs/tmp/probe
-524288 524288 /var/tmp/forge-rootfs/tmp/probe
+         0     524288      65536
+0 0 /bin/busybox
 ```
 
 The single supplementary group is the overflow gid — host root's group, which
 the map does not cover either. `setgroups` is denied inside the namespace, so a
 build cannot trade it for one that names something.
 
-A consequence worth knowing before it surprises you: the rootfs image is owned
-by host root and is therefore no longer writable from inside the sandbox. A
-build can write to `/tmp` and nowhere else in the image.
+### Every job gets its own root filesystem
+
+The image is the lower layer of an overlay; the upper layer is a tmpfs the
+sandbox mounts inside its own mount namespace. A build can write anywhere —
+install packages, edit `/etc`, delete from `/usr` — and the image on the host
+is untouched. When the job exits, its namespace goes and the layer with it:
+there is no per-job directory on the host and nothing to sweep.
+
+```
+$ sudo /tmp/forged -rootfs /var/tmp/forge-rootfs -- /bin/sh -c \
+    'apk del --quiet libc-utils; rm /etc/motd; echo built > /usr/out; ls /usr/out /usr/bin/getconf /etc/motd'
+ls: /etc/motd: No such file or directory
+ls: /usr/bin/getconf: No such file or directory
+/usr/out
+
+$ ls /var/tmp/forge-rootfs/usr/out /var/tmp/forge-rootfs/usr/bin/getconf /var/tmp/forge-rootfs/etc/motd
+ls: cannot access '/var/tmp/forge-rootfs/usr/out': No such file or directory
+/var/tmp/forge-rootfs/etc/motd
+/var/tmp/forge-rootfs/usr/bin/getconf
+```
+
+The layer's pages are charged to the job's cgroup like the rest of its memory,
+so `-memory-mb` bounds it too; a job that writes 64 MiB into `/usr` under a
+16 MiB limit is OOM-killed the same way one that allocates 64 MiB is.
 
 ### The worker pool
 
@@ -186,11 +205,17 @@ through `make vm-test` against a colima VM.
 
 ## Limitations
 
-Every job on a worker is mapped to the same host uid, so this is a boundary
-between a build and the host, not between two builds on the same worker. The
-rootfs image is shared too — it is no longer writable, but its `/tmp` is, and
-that is enough for one build to leave something for the next. Both want a
-per-job overlay.
+Every job on a worker is mapped to the same host uid range. Since the overlay,
+no two jobs share a writable filesystem, so what remains of that is on the
+host's side: everything any job creates outside its layer — nothing, today —
+would belong to the same ids.
+
+The overlay's upper layer is a tmpfs with the kernel's default size cap, half
+of RAM. A job with no memory limit can fill that much before writes fail with
+`ENOSPC`; a job with one hits the limit first.
+
+Nothing a build writes survives the job. Artifacts come out on stdout or not
+at all until a later phase gives the worker a way to collect them.
 
 The seccomp filter is an allowlist of syscall *numbers*; it never looks at
 arguments. `clone` has to be allowed for a build to fork at all, so its flags

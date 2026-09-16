@@ -48,13 +48,9 @@ MUTATIONS = [
         "\tif err := mountDev(rootfs); err != nil {\n\t\treturn err\n\t}\n",
         "",
     ),
-    (
-        "no-tmpfs-just-nodes",
-        SANDBOX,
-        '\tif err := syscall.Mount("tmpfs", dev, "tmpfs", devFlags, "mode=0755,size=64k"); err != nil {\n'
-        '\t\treturn fmt.Errorf("sandbox: mount %s: %w", dev, err)\n\t}\n',
-        "",
-    ),
+    # Retired 2026-09-16 with the per-job overlay: the mutation dropped the
+    # tmpfs under /dev and was caught by nodes leaking into the shared image,
+    # which the overlay now prevents on its own. Equivalent, so not scored.
     (
         "no-nodes",
         SANDBOX,
@@ -192,6 +188,29 @@ MUTATIONS = [
         "const namespaces = syscall.CLONE_NEWUSER | // user:    sandbox root is an unprivileged host uid\n\tsyscall.CLONE_NEWNS |",
         "const namespaces = syscall.CLONE_NEWNS |",
     ),
+    # --- the per-job overlay (Phase 1) ---
+    # No overlay: the image bind-mounted onto itself, as before Phase 1. Every
+    # write a build makes lands in the image and the next build inherits it.
+    (
+        "no-overlay-image-bound-directly",
+        SANDBOX,
+        "\tif err := mountOverlay(rootfs); err != nil {\n\t\treturn err\n\t}\n",
+        '\tif err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {\n'
+        '\t\treturn fmt.Errorf("sandbox: bind rootfs %s: %w", rootfs, err)\n\t}\n',
+    ),
+    # The lower layer is resolved from cwd, which is only the image because the
+    # child moved there first. Without that step "." is the host's root.
+    (
+        "lower-is-cwd-not-image",
+        SANDBOX,
+        '\tif err := syscall.Chdir(rootfs); err != nil {\n'
+        '\t\treturn fmt.Errorf("sandbox: chdir %s: %w", rootfs, err)\n\t}\n'
+        '\tif err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, "mode=0755"); err != nil {',
+        '\tif err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, "mode=0755"); err != nil {',
+    ),
+    # Not scored: dropping ",userxattr". On Ubuntu's 6.8 the mount sets its
+    # trusted.* xattrs from inside the user namespace without complaint, so no
+    # test can see the option; docs/decisions.md 2026-09-16 has the account.
 ]
 
 

@@ -3,7 +3,8 @@
 Status: **Phase 0 complete** — see [phase-0.md](phase-0.md) for what that
 means and how it is checked. The bounded worker pool, the sandbox's namespace
 isolation with a private device filesystem, per-job cgroups v2 resource limits,
-a deny-by-default seccomp filter and the user namespace exist. This document
+a deny-by-default seccomp filter, the user namespace and, from Phase 1, a
+per-job overlay root filesystem exist. This document
 describes the target shape and is updated as each milestone lands; anything
 not marked *implemented* is not built yet.
 
@@ -123,29 +124,48 @@ still in the code, now as an assertion — `/dev/null` is bound in only after th
 host's is confirmed to be character device 1:3. What has not changed is that
 the host's `/dev` is never mounted in wholesale; the set is exactly those six.
 
-The tmpfs is what makes it correct rather than merely present. The rootfs is
-bind-mounted and shared by every build on the worker, so without a mount over
-it, `dev/` is a writable directory in that shared image: a build redirecting to
-`/dev/null` creates a *file* of that name, which the next build inherits.
-Reads (`/dev/urandom`) failed loudly; writes succeeded and contaminated. With
-the tmpfs, both are correct and neither outlives the mount namespace, so there
-is no cleanup path to get wrong.
+The tmpfs is what makes it correct rather than merely present. Without a
+mount over it, `dev/` is a plain directory of the root filesystem: a build
+redirecting to `/dev/null` creates a *file* of that name. Reads
+(`/dev/urandom`) failed loudly; writes succeeded. With the tmpfs, both are
+correct and neither outlives the mount namespace, so there is no cleanup path
+to get wrong. (Before the overlay, the file also landed in the shared image
+and the next build inherited it.)
 
 **Sandbox root is not host root.** `CLONE_NEWUSER` maps uid and gid 0..65535
 inside to 524288..589823 outside, and `Credential` moves the child onto the
 first of them — the map alone would be decoration, since a child cloned from
 root keeps the root it was cloned with. The build still sees itself as uid 0
 and still holds `CAP_SYS_ADMIN` *in its own namespaces*, which is what lets it
-mount and `pivot_root`; on the host's side of the boundary it owns nothing. A
-consequence worth stating: the rootfs image belongs to host root, which the map
-does not cover, so the image is no longer writable from inside — `/tmp` is
-world-writable and is the only part a build can still contaminate.
+mount and `pivot_root`; on the host's side of the boundary it owns nothing.
+The image is shifted into the map once, at unpack (`hack/shift-rootfs.sh`), so
+its files belong to sandbox root from inside; host root stays unmapped.
+
+**Per-job overlay root filesystem** (Phase 1). The child mounts a tmpfs over
+the image path in its own mount namespace, makes `upper/` and `work/` on it,
+and mounts an overlay — the image as the lower layer, the tmpfs directories
+as upper and work — at the same path, then carries on exactly as before: proc
+and dev onto the merged tree, `pivot_root` into it. The image is resolved
+through the working directory, moved there before the tmpfs covers the path,
+because a cwd references the directory and not its name. Nothing is created
+on the host and nothing has to be removed: the layer is in a mount namespace
+that ends with the job. `userxattr` is set because the overlay marks whiteouts
+and opaque directories with xattrs, and only the `user.*` namespace is
+settable from a user namespace — without it a build can create but not
+delete. The layer's pages are tmpfs pages, charged to the job's cgroup, so
+`MemoryBytes` bounds it and there is no separate size.
+
+The overlay is why the image has to be in the map: the kernel refuses to copy
+up a file whose owner the mounter's user namespace cannot name (`EOVERFLOW`),
+and with a host-root-owned image that was every file. The alternative that
+keeps the image host-root-owned — an idmapped bind mount of the lower layer,
+made by the parent against the child's user namespace — needs the new mount
+API and a hand-off after the child starts; the shift is a one-time `chown`.
 
 **Not isolated yet**, and named as such in the README rather than implied away:
-every job on a worker shares one map, so this is a boundary between a build and
-the host rather than between two builds, and there is no network interface at
+every job on a worker shares one map, and there is no network interface at
 all. Resource limits landed in Week 3, the syscall filter in Week 4, the user
-namespace in Week 5.
+namespace in Week 5, the overlay in Phase 1.
 
 Tests live behind `//go:build linux` and need `CAP_SYS_ADMIN` plus an unpacked
 rootfs; `make test-sandbox` on Linux, `make vm-test` from macOS via colima, and
@@ -248,10 +268,10 @@ from another architecture's numbers.
 
 ## Next
 
-Phase 0's five named weeks are done: the worker pool, the sandbox, cgroup
-limits, the private `/dev`, the seccomp filter and the user namespace. What is
-still open is written down rather than implied — a per-job rootfs, so `/tmp` is
-not shared between builds and one map is not shared by every job on a worker;
-argument filtering for `clone`, whose flags the number-only filter cannot
-bound; and the capability bounding set. [phase-0.md](phase-0.md) is the
-definition of done and carries that list.
+Phase 0's five named weeks are done, and Phase 1 has started with the per-job
+overlay. What is still open is written down rather than implied — argument
+filtering for `clone`, whose flags the number-only filter cannot bound; the
+capability bounding set; `/dev/ptmx` and `/dev/shm`; and a way for a build's
+output to leave the job, now that nothing it writes survives.
+[phase-0.md](phase-0.md) is Phase 0's definition of done and carries the list
+as it stood then.

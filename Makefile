@@ -44,13 +44,18 @@ clean:
 	rm -f $(VM_TEST_BIN) $(VM_CGROUP_BIN)
 
 ## rootfs: unpack an Alpine root filesystem for the sandbox to run in
+# The files are then shifted into the sandbox's uid map, which the overlay
+# needs in order to copy them up; see hack/shift-rootfs.sh. Re-running only
+# repeats the shift, which is idempotent, so an image unpacked before the
+# overlay existed is brought up to date by the same target.
 rootfs:
 	@test -n "$(ALPINE_SHA256)" || { echo "no pinned checksum for $(ALPINE_ARCH)"; exit 1; }
-	@if [ -x "$(ROOTFS)/bin/sh" ]; then echo "$(ROOTFS) already unpacked"; exit 0; fi; \
+	@if [ -x "$(ROOTFS)/bin/sh" ]; then echo "$(ROOTFS) already unpacked"; else \
 	tmp=$$(mktemp -d) && curl -fsSL "$(ALPINE_URL)" -o "$$tmp/rootfs.tar.gz" && \
 	echo "$(ALPINE_SHA256)  $$tmp/rootfs.tar.gz" | sha256sum -c - && \
 	sudo mkdir -p "$(ROOTFS)" && sudo tar -xzf "$$tmp/rootfs.tar.gz" -C "$(ROOTFS)" && \
-	rm -rf "$$tmp" && echo "unpacked alpine $(ALPINE_VERSION) into $(ROOTFS)"
+	rm -rf "$$tmp" && echo "unpacked alpine $(ALPINE_VERSION) into $(ROOTFS)"; fi
+	sudo hack/shift-rootfs.sh "$(ROOTFS)"
 
 ## test-sandbox: the Linux-only isolation tests, as root (Linux hosts and CI)
 # The test binary is built and then run under sudo, rather than running
@@ -71,6 +76,7 @@ vm-test: $(VM_TEST_BIN) $(VM_CGROUP_BIN)
 	    echo "$(ALPINE_SHA256)  /tmp/rootfs.tgz" | sha256sum -c -; \
 	    sudo mkdir -p $(ROOTFS); sudo tar -xzf /tmp/rootfs.tgz -C $(ROOTFS); \
 	  fi; \
+	  sudo $(CURDIR)/hack/shift-rootfs.sh $(ROOTFS); \
 	  cp $(VM_TEST_BIN) /tmp/forge-sandbox.test; \
 	  cp $(VM_CGROUP_BIN) /tmp/forge-cgroup.test; \
 	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1; \
