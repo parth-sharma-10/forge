@@ -1,77 +1,81 @@
-// Command forge-worker will become Forge's job executor. Today it is a driver
-// for internal/pool: it submits synthetic tasks and demonstrates the two
-// shutdown modes the real worker will need.
+// Command forge-worker claims jobs from the queue and runs them in the
+// sandbox. It must run as root on Linux, like forged, and must call
+// sandbox.MaybeChild before anything else, because the sandbox re-executes
+// this binary as the child that builds the isolation.
 //
-//	first SIGINT/SIGTERM  -> drain: stop accepting, finish accepted work
-//	second SIGINT/SIGTERM -> cancel: propagate cancellation into running tasks
+//	first SIGINT/SIGTERM  -> drain: finish the jobs in hand, claim no more
+//	second SIGINT/SIGTERM -> cancel: kill the jobs in hand
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log/slog"
-	"math/rand"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
-	"github.com/parth-sharma-10/forge/internal/pool"
+	"github.com/parth-sharma-10/forge/internal/cgroup"
+	"github.com/parth-sharma-10/forge/internal/queue"
+	"github.com/parth-sharma-10/forge/internal/sandbox"
+	"github.com/parth-sharma-10/forge/internal/worker"
 )
 
 func main() {
+	sandbox.MaybeChild()
+
+	hostname, _ := os.Hostname()
 	var (
-		workers = flag.Int("workers", 4, "concurrent workers")
-		queue   = flag.Int("queue", 8, "queued tasks before Submit blocks")
-		tasks   = flag.Int("tasks", 20, "synthetic tasks to submit")
-		dur     = flag.Duration("task-duration", 250*time.Millisecond, "how long each synthetic task runs")
+		dsn        = flag.String("dsn", os.Getenv("FORGE_DSN"), "PostgreSQL connection string (or FORGE_DSN)")
+		rootfs     = flag.String("rootfs", "", "absolute path to the root filesystem jobs run in")
+		workers    = flag.Int("workers", 4, "jobs run at once")
+		name       = flag.String("name", hostname, "this worker's name, recorded on the jobs it claims")
+		lease      = flag.Duration("lease", 30*time.Second, "how long a claim holds without a heartbeat")
+		poll       = flag.Duration("poll", time.Second, "how long to wait after finding the queue empty")
+		memoryMB   = flag.Int64("memory-mb", 0, "memory limit per job in MiB (0 for unlimited)")
+		cpuCores   = flag.Float64("cpu", 0, "CPU limit per job in cores (0 for unlimited)")
+		maxPIDs    = flag.Int("pids", 0, "maximum processes per job (0 for unlimited)")
+		cgroupRoot = flag.String("cgroup-root", cgroup.DefaultRoot, "parent cgroup for the jobs' cgroups")
 	)
 	flag.Parse()
+	if *dsn == "" || *rootfs == "" {
+		fmt.Fprintln(os.Stderr, "usage: forge-worker -dsn postgres://... -rootfs /path [flags]")
+		flag.PrintDefaults()
+		os.Exit(2)
+	}
 
-	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	slog.SetDefault(log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	q, err := queue.Open(ctx, *dsn)
+	if err != nil {
+		log.Error("queue", "err", err)
+		os.Exit(1)
+	}
+	defer q.Close()
 
-	p := pool.New(*workers, *queue)
-	p.Start(ctx)
-
+	stop := make(chan struct{})
 	sigs := make(chan os.Signal, 2)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-sigs
-		log.Info("signal received, draining: no new work accepted")
-		p.Close()
+		log.Info("signal received, draining: finishing jobs in hand, claiming no more")
+		close(stop)
 		<-sigs
-		log.Warn("second signal, cancelling work in flight")
+		log.Warn("second signal, killing jobs in hand")
 		cancel()
 	}()
 
-	for i := 0; i < *tasks; i++ {
-		i := i
-		err := p.Submit(ctx, func(taskCtx context.Context) error {
-			log.Info("task started", "task", i)
-			select {
-			case <-time.After(jitter(*dur)):
-				log.Info("task done", "task", i)
-				return nil
-			case <-taskCtx.Done():
-				log.Info("task cancelled", "task", i)
-				return taskCtx.Err()
-			}
-		})
-		if err != nil {
-			log.Info("stopped submitting", "submitted", i, "reason", err)
-			break
-		}
+	w := &worker.Worker{
+		Store: q, Name: *name, Rootfs: *rootfs, CgroupRoot: *cgroupRoot,
+		Limits: cgroup.Limits{MemoryBytes: *memoryMB << 20, CPUCores: *cpuCores, MaxPIDs: *maxPIDs},
+		Lease:  *lease, Poll: *poll, Log: log,
 	}
-
-	p.Close()
-	p.Wait()
+	log.Info("worker started", "name", *name, "workers", *workers, "rootfs", *rootfs)
+	w.Serve(ctx, stop, *workers)
 	log.Info("worker exited cleanly")
-}
-
-func jitter(d time.Duration) time.Duration {
-	return d + time.Duration(rand.Int63n(int64(d/2+1)))
 }
