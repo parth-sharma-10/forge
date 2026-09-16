@@ -45,9 +45,21 @@ before the first line of code, as [phase-0.md](phase-0.md) and
 
 ## Exit criteria
 
-1. CI green on x86_64: `make test` with the queue tests running against
-   the service container, and `make test-sandbox` with the end-to-end
-   test running, neither skipped.
-2. `make test` locally against a scratch PostgreSQL: 0 failures.
-3. `go.mod` requires exactly one module.
-4. The README shows a job submitted, claimed and reported, with real output.
+All four held on 2026-09-16 at the commit this file was last changed in.
+
+1. **CI green on x86_64**, `make test` with the queue tests running against
+   the service container and `make test-sandbox` with `TestEndToEnd`
+   running: 72 passes, 0 skips, 0 failures in the privileged step, read
+   from the log.
+2. **`make test` locally against a scratch PostgreSQL 18: 0 failures.**
+   `make vm-test` against PostgreSQL 16 in the colima VM: 72 passes, 0
+   skips, 0 failures.
+3. **`go.mod` requires exactly one module**, `github.com/jackc/pgx/v5`.
+4. **The README shows a job submitted, claimed and reported**, output
+   pasted from the run, not typed.
+
+No mutations for this phase: `hack/mutate.py` is the sandbox's harness and
+runs in the VM. The queue's tests are against the database itself, and the
+mutants worth writing — the fence check dropped from `Report`, the reclaim
+clause dropped from `Claim` — are Phase 4's, when more than one worker is
+what the tests kill.
