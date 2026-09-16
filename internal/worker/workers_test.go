@@ -73,7 +73,7 @@ func runTestWorker(name string) {
 
 // openQueue connects to the test database and empties the table, with the
 // same skip-or-fail rule as the queue's own tests.
-func openQueue(t *testing.T) *queue.Queue {
+func openQueue(t testing.TB) *queue.Queue {
 	t.Helper()
 	dsn := os.Getenv(dsnEnv)
 	if dsn == "" {

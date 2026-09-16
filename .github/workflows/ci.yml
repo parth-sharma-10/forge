@@ -36,3 +36,7 @@ jobs:
       # a separate step: `make test` above runs unprivileged and would skip
       # every one of them. GitHub's runners give passwordless sudo.
       - run: make test-sandbox
+      # The benchmarks run for their numbers, which are logged and not
+      # asserted: a shared runner's timings are not a gate.
+      - run: make bench
+      - run: make verify-units

@@ -100,6 +100,18 @@ const rootfsEnv = "FORGE_TEST_ROOTFS"
 // skipping when the environment cannot host them. See `make rootfs`.
 func rootfs(t *testing.T) string {
 	t.Helper()
+	return rootfsFor(t)
+}
+
+// benchRootfs is rootfs for a benchmark.
+func benchRootfs(b *testing.B) string {
+	b.Helper()
+	return rootfsFor(b)
+}
+
+// rootfsFor does the checks for either.
+func rootfsFor(t testing.TB) string {
+	t.Helper()
 	dir := os.Getenv(rootfsEnv)
 	if dir == "" {
 		t.Skipf("%s not set: run `make test-sandbox`", rootfsEnv)
@@ -135,7 +147,7 @@ func rootfs(t *testing.T) string {
 
 // mountedOnHost reports whether dir is a mount point in the caller's mount
 // namespace, which for the test process is the host's.
-func mountedOnHost(t *testing.T, dir string) bool {
+func mountedOnHost(t testing.TB, dir string) bool {
 	t.Helper()
 	mountinfo, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
