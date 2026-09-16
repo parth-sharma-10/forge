@@ -9,14 +9,14 @@ import (
 )
 
 // evaluate runs the filter the way the kernel's BPF interpreter would, over
-// the three instructions seccompFilter emits and a struct seccomp_data holding
-// nothing but a syscall number and an architecture.
+// the four instructions seccompFilter emits and a struct seccomp_data holding
+// a syscall number, an architecture and the low word of the first argument.
 //
 // These tests need no privileges and no kernel support, which is the point:
 // the policy — what is allowed, what is denied, what happens under another ABI
 // — is checkable everywhere, and the privileged tests in
 // sandbox_linux_test.go are left to prove the filter is actually installed.
-func evaluate(f []syscall.SockFilter, arch uint32, nr int) (uint32, error) {
+func evaluate(f []syscall.SockFilter, arch uint32, nr int, arg0 uint32) (uint32, error) {
 	var accumulator uint32
 	for pc := 0; pc < len(f); {
 		in := f[pc]
@@ -27,12 +27,20 @@ func evaluate(f []syscall.SockFilter, arch uint32, nr int) (uint32, error) {
 				accumulator = uint32(nr)
 			case offsetArch:
 				accumulator = arch
+			case offsetArg0:
+				accumulator = arg0
 			default:
 				return 0, fmt.Errorf("instruction %d loads offset %d, which is not a field this filter reads", pc, in.K)
 			}
 			pc++
 		case bpfJumpEqual:
 			if accumulator == in.K {
+				pc += 1 + int(in.Jt)
+			} else {
+				pc += 1 + int(in.Jf)
+			}
+		case bpfJumpSet:
+			if accumulator&in.K != 0 {
 				pc += 1 + int(in.Jt)
 			} else {
 				pc += 1 + int(in.Jf)
@@ -51,7 +59,7 @@ func evaluate(f []syscall.SockFilter, arch uint32, nr int) (uint32, error) {
 func TestFilterAllowsEverySyscallOnTheList(t *testing.T) {
 	f := seccompFilter()
 	for _, nr := range allowedSyscalls() {
-		got, err := evaluate(f, auditArch, nr)
+		got, err := evaluate(f, auditArch, nr, 0)
 		if err != nil {
 			t.Fatalf("syscall %d: %v", nr, err)
 		}
@@ -88,10 +96,11 @@ func TestFilterDeniesTheKernelFacingSurface(t *testing.T) {
 		"add_key":         syscall.SYS_ADD_KEY,
 		"keyctl":          syscall.SYS_KEYCTL,
 		"perf_event_open": syscall.SYS_PERF_EVENT_OPEN,
+		"clone3":          sysClone3,
 	}
 	f := seccompFilter()
 	for name, nr := range denied {
-		got, err := evaluate(f, auditArch, nr)
+		got, err := evaluate(f, auditArch, nr, 0)
 		if err != nil {
 			t.Fatalf("%s: %v", name, err)
 		}
@@ -120,6 +129,52 @@ func TestDenialIsENOSYS(t *testing.T) {
 	}
 }
 
+// TestFilterDeniesCloneWithNamespaceFlags is the policy half of bounding
+// clone. A fork and a thread pass; any one CLONE_NEW* bit is refused with
+// EPERM rather than ENOSYS, because the syscall is not missing — this use of
+// it is. The refusal is checked one flag at a time so that a mask missing a
+// single namespace is a single failing case rather than a green run.
+func TestFilterDeniesCloneWithNamespaceFlags(t *testing.T) {
+	f := seccompFilter()
+	const sigchld = uint32(syscall.SIGCHLD)
+	allowed := map[string]uint32{
+		"fork":   sigchld,
+		"thread": syscall.CLONE_VM | syscall.CLONE_FS | syscall.CLONE_FILES | syscall.CLONE_SIGHAND | syscall.CLONE_THREAD | syscall.CLONE_SYSVSEM | syscall.CLONE_SETTLS,
+		"vfork":  syscall.CLONE_VM | syscall.CLONE_VFORK | sigchld,
+	}
+	for name, flags := range allowed {
+		got, err := evaluate(f, auditArch, syscall.SYS_CLONE, flags)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got != retAllow {
+			t.Errorf("clone as a %s (flags %#x) returns %#x, want SECCOMP_RET_ALLOW", name, flags, got)
+		}
+	}
+
+	namespaces := map[string]uint32{
+		"CLONE_NEWNS":     syscall.CLONE_NEWNS,
+		"CLONE_NEWUTS":    syscall.CLONE_NEWUTS,
+		"CLONE_NEWIPC":    syscall.CLONE_NEWIPC,
+		"CLONE_NEWUSER":   syscall.CLONE_NEWUSER,
+		"CLONE_NEWPID":    syscall.CLONE_NEWPID,
+		"CLONE_NEWNET":    syscall.CLONE_NEWNET,
+		"CLONE_NEWCGROUP": syscall.CLONE_NEWCGROUP,
+	}
+	for name, flag := range namespaces {
+		got, err := evaluate(f, auditArch, syscall.SYS_CLONE, flag|sigchld)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if got == retAllow {
+			t.Errorf("clone with %s is allowed", name)
+		}
+		if want := retErrno | uint32(syscall.EPERM); got != want {
+			t.Errorf("clone with %s returns %#x, want EPERM (%#x)", name, got, want)
+		}
+	}
+}
+
 // TestFilterKillsAnotherABI uses a syscall that is allowed under this
 // architecture: it is the architecture that has to be what decides, not the
 // number, or a 32-bit process could reach a denied syscall through a number
@@ -127,7 +182,7 @@ func TestDenialIsENOSYS(t *testing.T) {
 func TestFilterKillsAnotherABI(t *testing.T) {
 	const auditArchI386 = 0x40000003
 	f := seccompFilter()
-	got, err := evaluate(f, auditArchI386, syscall.SYS_READ)
+	got, err := evaluate(f, auditArchI386, syscall.SYS_READ, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,8 +193,8 @@ func TestFilterKillsAnotherABI(t *testing.T) {
 
 func TestFilterFitsTheKernelLimit(t *testing.T) {
 	f := seccompFilter()
-	if want := 2*len(allowedSyscalls()) + 5; len(f) != want {
-		t.Errorf("filter is %d instructions, want %d: four of prologue, two per syscall, one deny", len(f), want)
+	if want := 2*len(allowedSyscalls()) + 8; len(f) != want {
+		t.Errorf("filter is %d instructions, want %d: four of prologue, two per syscall, three more for clone, one deny", len(f), want)
 	}
 	if len(f) > maxFilterLen {
 		t.Errorf("filter is %d instructions, over the kernel's limit of %d", len(f), maxFilterLen)

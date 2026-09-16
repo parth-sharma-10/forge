@@ -11,6 +11,10 @@ import "syscall"
 // killed rather than matched against the wrong table.
 const auditArch = 0xc000003e
 
+// sysClone3 is clone3(2), the same number on every architecture that has it.
+// Named so the tests can assert it is denied; it is not on the allowlist.
+const sysClone3 = 435
+
 // sysSeccomp is seccomp(2). Go's syscall package froze its Linux syscall
 // numbers before seccomp existed on amd64, so this one is written out; on
 // arm64 the same constant comes from syscall. A wrong number here does not

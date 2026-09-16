@@ -20,25 +20,36 @@ import (
 // below is under twenty lines of encoding, and libseccomp is cgo, which would
 // put a C toolchain and a shared library between Forge and a static binary.
 //
-// ponytail: the filter looks only at the syscall number, never at arguments.
-// That is what leaves clone's flags unbounded — a build can still ask for new
-// namespaces, since clone must be allowed for it to fork at all. Argument
-// filtering is a second comparison against seccomp_data.args; add it when the
-// user namespace lands and clone's flags start mattering.
+// One syscall is filtered on an argument as well as its number: clone, whose
+// flags decide whether the call is a fork or a new set of namespaces. Every
+// other decision is by number alone.
 const (
 	// BPF instruction encodings, from linux/bpf_common.h.
 	bpfLoadWordAbs = 0x20 // BPF_LD | BPF_W | BPF_ABS
 	bpfJumpEqual   = 0x15 // BPF_JMP | BPF_JEQ | BPF_K
+	bpfJumpSet     = 0x45 // BPF_JMP | BPF_JSET | BPF_K: jump if (A & K) != 0
 	bpfReturn      = 0x06 // BPF_RET | BPF_K
 
-	// Byte offsets into struct seccomp_data.
+	// Byte offsets into struct seccomp_data. args[0] is a u64 at 16; classic
+	// BPF loads 32 bits, and on the little-endian architectures Forge builds
+	// for the low half is at the lower address.
 	offsetNr   = 0
 	offsetArch = 4
+	offsetArg0 = 16
 
 	// Filter results, from linux/seccomp.h.
 	retAllow       = 0x7fff0000 // SECCOMP_RET_ALLOW
 	retKillProcess = 0x80000000 // SECCOMP_RET_KILL_PROCESS
 	retErrno       = 0x00050000 // SECCOMP_RET_ERRNO, or'd with the errno to return
+
+	// cloneNamespaceFlags are the CLONE_NEW* bits: every one of them asks the
+	// kernel for a namespace the build would own. The legacy clone reads its
+	// flags from the low 32 bits of the first argument and ignores the rest,
+	// so a mask over the low word is a mask over everything the kernel sees.
+	// CLONE_NEWTIME is not here because it is not here for clone either: its
+	// bit is inside CSIGNAL, and only clone3 can pass it — which is denied.
+	cloneNamespaceFlags = syscall.CLONE_NEWNS | syscall.CLONE_NEWUTS | syscall.CLONE_NEWIPC |
+		syscall.CLONE_NEWUSER | syscall.CLONE_NEWPID | syscall.CLONE_NEWNET | syscall.CLONE_NEWCGROUP
 
 	// maxFilterLen is BPF_MAXINSNS: the kernel rejects a longer program.
 	maxFilterLen = 4096
@@ -64,16 +75,29 @@ const (
 // makes a denial loud, and it is a one-constant change here.
 const denyAction = retErrno | uint32(syscall.ENOSYS)
 
+// cloneDenyAction is what clone returns when asked for a namespace: EPERM,
+// not ENOSYS. The syscall exists and the build may use it; this particular
+// use is refused, which is what the kernel itself says to a process without
+// the privilege to create namespaces. ENOSYS would tell a C library to try
+// an older way of doing the same thing, and there is none.
+const cloneDenyAction = retErrno | uint32(syscall.EPERM)
+
 // seccompFilter builds the BPF program for the current architecture.
 //
-// Every jump offset is 0 or 1 — each comparison either falls through to its
-// own return or steps over it to the next comparison. The alternative, one
-// comparison per syscall jumping to a shared return at the end, is half the
-// instructions and computes an offset that silently overflows the uint8 jump
-// field once the allowlist passes 255 entries.
+// Every jump offset is small and local — each comparison either falls through
+// to its own return or steps over it to the next comparison. The alternative,
+// one comparison per syscall jumping to a shared return at the end, is half
+// the instructions and computes an offset that silently overflows the uint8
+// jump field once the allowlist passes 255 entries.
+//
+// clone is the one entry with a second test. Its block reads the flags into
+// the accumulator, which is why it must end in a return on both paths: a
+// fall-through would compare the flags, not the number, against the rest of
+// the list. A syscall that is not clone jumps over the whole block with the
+// number still loaded.
 func seccompFilter() []syscall.SockFilter {
 	allowed := allowedSyscalls()
-	f := make([]syscall.SockFilter, 0, 2*len(allowed)+5)
+	f := make([]syscall.SockFilter, 0, 2*len(allowed)+8)
 
 	// Reject a syscall issued under any other ABI before reading its number:
 	// under x32 or i386 compat the same numbers name entirely different
@@ -86,6 +110,16 @@ func seccompFilter() []syscall.SockFilter {
 		syscall.SockFilter{Code: bpfLoadWordAbs, K: offsetNr},
 	)
 	for _, nr := range allowed {
+		if nr == syscall.SYS_CLONE {
+			f = append(f,
+				syscall.SockFilter{Code: bpfJumpEqual, Jf: 4, K: uint32(nr)},
+				syscall.SockFilter{Code: bpfLoadWordAbs, K: offsetArg0},
+				syscall.SockFilter{Code: bpfJumpSet, Jt: 1, K: cloneNamespaceFlags},
+				syscall.SockFilter{Code: bpfReturn, K: retAllow},
+				syscall.SockFilter{Code: bpfReturn, K: cloneDenyAction},
+			)
+			continue
+		}
 		f = append(f,
 			syscall.SockFilter{Code: bpfJumpEqual, Jf: 1, K: uint32(nr)},
 			syscall.SockFilter{Code: bpfReturn, K: retAllow},
@@ -142,7 +176,8 @@ func applySeccomp() error {
 // mknod, ptrace, process_vm_readv, bpf, perf_event_open, init_module,
 // kexec_load, setns, unshare, keyctl, userfaultfd, open_by_handle_at, iopl,
 // syslog, reboot, swapon, settimeofday and the rest of the kernel-facing
-// surface.
+// surface. clone3 too: its flags live in a struct the filter cannot read, so
+// it is denied by number and glibc falls back to clone, where they can be.
 func allowedSyscalls() []int {
 	return append([]int{
 		// Process lifecycle and identity.
