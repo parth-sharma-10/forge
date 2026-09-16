@@ -228,7 +228,7 @@ table and what each one rising means.
 ### Numbers
 
 From `make bench` in CI on a GitHub-hosted `ubuntu-latest` runner (x86_64,
-Ubuntu kernel 6.x, `GOMAXPROCS` 2, PostgreSQL 17 in a service container,
+`GOMAXPROCS` 2 as Go saw it, PostgreSQL 17 in a service container,
 the Alpine image), one run of twenty iterations — the log of
 [PR #15](https://github.com/parth-sharma-10/forge/pull/15)'s `bench` step.
 
