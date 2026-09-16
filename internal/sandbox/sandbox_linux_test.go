@@ -45,6 +45,17 @@ func rootfs(t *testing.T) string {
 	if _, err := os.Lstat(filepath.Join(dir, "bin/sh")); err != nil {
 		t.Fatalf("%s=%s does not look like a root filesystem: %v", rootfsEnv, dir, err)
 	}
+	// The overlay copies a file up only if the sandbox can name its owner,
+	// and host root is the one id the map leaves out. hack/shift-rootfs.sh
+	// moves the image into the map; the check is here so the two constants
+	// cannot drift apart silently.
+	var st syscall.Stat_t
+	if err := syscall.Stat(dir, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Uid != mappedBase {
+		t.Fatalf("%s is owned by uid %d, want %d: run `sudo hack/shift-rootfs.sh %s`", dir, st.Uid, mappedBase, dir)
+	}
 	// A bind mount left on the host by an earlier broken run satisfies
 	// pivot_root's mount-point requirement for free, so the suite would pass
 	// without the code that is supposed to create it. Refuse to run dirty.
@@ -74,6 +85,36 @@ func mountedOnHost(t *testing.T, dir string) bool {
 func sh(t *testing.T, script string) (string, error) {
 	t.Helper()
 	return runArgs(t, "/bin/sh", "-c", script)
+}
+
+// shIn is sh against a given root filesystem rather than the shared image.
+func shIn(t *testing.T, dir, script string) (string, error) {
+	t.Helper()
+	return runSpec(t, Spec{Rootfs: dir, Hostname: "forge-test", Args: []string{"/bin/sh", "-c", script}})
+}
+
+// scratchImage is a private copy of the image for a test whose build writes
+// outside /tmp. With the overlay in place the copy is never touched; without
+// it — which is what the mutation harness checks — the writes land here and
+// not in the image every other test shares. cp -a keeps the shifted owners.
+//
+// Not under t.TempDir(): that is mode 0700 and owned by host root, which the
+// sandbox does not map, so the child could not reach the image inside it.
+func scratchImage(t *testing.T) string {
+	t.Helper()
+	parent, err := os.MkdirTemp("", "forge-image-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(parent) })
+	if err := os.Chmod(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(parent, "rootfs")
+	if out, err := exec.Command("cp", "-a", rootfs(t), dir).CombinedOutput(); err != nil {
+		t.Fatalf("cp -a: %v: %s", err, out)
+	}
+	return dir
 }
 
 func runArgs(t *testing.T, args ...string) (string, error) {
@@ -312,9 +353,9 @@ func TestDevDoesNotOutliveTheSandbox(t *testing.T) {
 	if mountedOnHost(t, dev) {
 		t.Fatalf("the sandbox's tmpfs on %s survived in the host mount namespace", dev)
 	}
-	// The whole reason /dev is a mount and not a set of files: the rootfs
-	// image is shared by every build on the worker, and a `> /dev/null` in one
-	// of them would otherwise leave a regular file behind for the next.
+	// A `> /dev/null` must not leave a regular file behind in the image. The
+	// overlay guarantees that on its own now; the tmpfs under /dev did before
+	// it, and still keeps the nodes out of the job's own root filesystem.
 	if leaked := emptyDir(t, dev); len(leaked) != 0 {
 		t.Fatalf("%s is not empty after the run (%v): the build wrote into the rootfs image", dev, leaked)
 	}
@@ -634,39 +675,26 @@ cd / && rm -rf /tmp/forge-build`
 }
 
 // TestSandboxRootIsAnUnprivilegedHostUid is what the user namespace is for: the
-// build believes it is root and the kernel disagrees. The second file is the
-// assertion behind mapping a range rather than the single id the build runs as
-// — a package manager that chowns is the ordinary case, not an exotic one.
+// build believes it is root and the kernel disagrees. The map is read from
+// inside, where the kernel prints it as "inside outside count": the outside
+// field pins that uid 0 in the sandbox is mappedBase on the host, and the
+// count that host root is not among the ids the sandbox can name. `id -u`
+// is the other half — a child cloned from root keeps host root unless
+// Credential moves it, and host root is unmapped here, so it would print
+// the overflow uid. The chown is the assertion behind mapping a range rather
+// than the single id the build runs as: a package manager that chowns is
+// the ordinary case, and gets EINVAL for any id outside the map.
 func TestSandboxRootIsAnUnprivilegedHostUid(t *testing.T) {
 	dir := rootfs(t)
-	probe := filepath.Join(dir, "tmp/forge-userns")
-	t.Cleanup(func() { os.RemoveAll(probe) })
-
-	out, err := sh(t, "set -e; mkdir -p /tmp/forge-userns; cd /tmp/forge-userns; "+
-		"touch mine theirs; chown 1000:1000 theirs; id -u")
+	t.Cleanup(func() { os.Remove(filepath.Join(dir, "tmp/theirs")) })
+	out, err := sh(t, "set -e; id -u; touch /tmp/theirs; chown 1000:1000 /tmp/theirs; "+
+		"stat -c %u /tmp/theirs; cat /proc/self/uid_map")
 	if err != nil {
 		t.Fatalf("run: %v (output %q)", err, out)
 	}
-	if out != "0" {
-		t.Fatalf("uid inside sandbox = %q, want 0", out)
-	}
-
-	for _, c := range []struct {
-		file   string
-		inside uint32
-	}{{"mine", 0}, {"theirs", 1000}} {
-		var st syscall.Stat_t
-		if err := syscall.Stat(filepath.Join(probe, c.file), &st); err != nil {
-			t.Fatal(err)
-		}
-		want := uint32(mappedBase) + c.inside
-		if st.Uid != want || st.Gid != want {
-			t.Errorf("%s is owned by %d:%d on the host, want %d:%d — uid %d inside the sandbox is not mapped where the map says",
-				c.file, st.Uid, st.Gid, want, want, c.inside)
-		}
-		if st.Uid == 0 {
-			t.Errorf("%s is owned by host root: the build is still running as the real thing", c.file)
-		}
+	want := fmt.Sprintf("0 1000 0 %d %d", mappedBase, mappedCount)
+	if got := strings.Join(strings.Fields(out), " "); got != want {
+		t.Fatalf("uid, chown result and uid_map inside the sandbox = %q, want %q", got, want)
 	}
 }
 
@@ -685,48 +713,107 @@ func TestSetgroupsIsDeniedInTheNamespace(t *testing.T) {
 	}
 }
 
-// TestTheRootfsImageIsNotWritable is the other half of the same fact, from the
-// filesystem's side. The image belongs to host root, which the sandbox's map
-// does not cover, so being root inside buys nothing against it — CAP_DAC_OVERRIDE
-// only reaches files owned by a uid the namespace can name.
+// TestTheImageIsNeverWritten is the overlay's reason to exist. A build may
+// write anywhere — /usr, an existing file in /etc, delete one, replace a
+// directory — and sees its own writes; the image on the host is the same
+// afterwards, byte for byte where it was edited and present where it was
+// deleted.
 //
-// It is also the first thing that stops one build contaminating the next
-// through the shared image. Only what is world-writable in the image — /tmp —
-// is still shared, and an overlay per job is what closes that.
-func TestTheRootfsImageIsNotWritable(t *testing.T) {
-	dir := rootfs(t)
-	leaked := filepath.Join(dir, "etc/forge-probe")
-	t.Cleanup(func() { os.Remove(leaked) })
-
-	out, err := sh(t, "touch /etc/forge-probe 2>/dev/null && echo WROTE || echo REFUSED")
-	if err != nil {
-		t.Fatalf("run: %v (output %q)", err, out)
-	}
-	if out != "REFUSED" {
-		t.Fatalf("a build wrote into /etc of the shared rootfs image: %q", out)
-	}
-	if _, err := os.Stat(leaked); !os.IsNotExist(err) {
-		t.Fatalf("%s exists on the host (stat: %v): the write was refused and happened anyway", leaked, err)
-	}
-}
-
-// TestHostRootHasNoIdentityInsideTheSandbox pins the direction of the map. Only
-// the 65536 ids starting at mappedBase are mapped, and host root is not among
-// them, so every file the image carries belongs to nobody as far as the sandbox
-// is concerned. A map that reached host uid 0 would undo the whole change while
-// leaving every other test above green.
-func TestHostRootHasNoIdentityInsideTheSandbox(t *testing.T) {
-	overflow, err := os.ReadFile("/proc/sys/kernel/overflowuid")
+// The replaced directory is the case that depends on the overlay's own
+// metadata: it marks a directory that hides its lower namesake with an
+// xattr, and an overlay that could not set one would list the image's
+// entries through the directory a build removed and made again.
+func TestTheImageIsNeverWritten(t *testing.T) {
+	dir := scratchImage(t)
+	hostname, err := os.ReadFile(filepath.Join(dir, "etc/hostname"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := strings.TrimSpace(string(overflow))
+	keys, err := os.ReadDir(filepath.Join(dir, "etc/apk/keys"))
+	if err != nil || len(keys) == 0 {
+		t.Fatalf("etc/apk/keys in the image: %d entries, %v", len(keys), err)
+	}
 
-	out, err := sh(t, "stat -c %u /bin/busybox")
+	out, err := shIn(t, dir, `set -e
+echo probe > /usr/forge-probe && cat /usr/forge-probe
+echo edited >> /etc/hostname && tail -n1 /etc/hostname
+rm /etc/motd && test ! -e /etc/motd && echo motd-gone
+rm -r /etc/apk/keys && mkdir /etc/apk/keys && echo "keys: $(ls /etc/apk/keys | wc -l)"`)
 	if err != nil {
 		t.Fatalf("run: %v (output %q)", err, out)
 	}
-	if out != want {
-		t.Fatalf("/bin/busybox is owned by uid %s inside the sandbox, want %s (the overflow uid): host root is mapped into the namespace", out, want)
+	if out != "probe\nedited\nmotd-gone\nkeys: 0" {
+		t.Fatalf("output = %q: a build cannot see its own writes", out)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, "usr/forge-probe")); !os.IsNotExist(err) {
+		t.Errorf("usr/forge-probe exists in the image on the host (stat: %v): the write reached the lower layer", err)
+	}
+	if after, _ := os.ReadFile(filepath.Join(dir, "etc/hostname")); !bytes.Equal(after, hostname) {
+		t.Errorf("etc/hostname in the image changed from %q to %q", hostname, after)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "etc/motd")); err != nil {
+		t.Errorf("etc/motd is gone from the image on the host: %v", err)
+	}
+	if after, _ := os.ReadDir(filepath.Join(dir, "etc/apk/keys")); len(after) != len(keys) {
+		t.Errorf("etc/apk/keys in the image has %d entries, had %d", len(after), len(keys))
+	}
+}
+
+// TestNoWritableStateOutlivesAJob is the build-to-build half: the layer is a
+// tmpfs in the job's own mount namespace, so it is gone with the namespace,
+// and the next job starts from the image and nothing else.
+func TestNoWritableStateOutlivesAJob(t *testing.T) {
+	dir := scratchImage(t)
+	out, err := shIn(t, dir, "touch /usr/forge-first /tmp/forge-first && echo written")
+	if err != nil {
+		t.Fatalf("first job: %v (output %q)", err, out)
+	}
+	out, err = shIn(t, dir, "ls /usr/forge-first /tmp/forge-first 2>/dev/null; echo checked")
+	if err != nil {
+		t.Fatalf("second job: %v (output %q)", err, out)
+	}
+	if out != "checked" {
+		t.Fatalf("the second job found the first job's files: %q", out)
+	}
+}
+
+// TestAPackageManagerCanChangeTheInstalledSet runs the real thing over the
+// overlay: apk rewrites its database, unlinks files under /usr and /etc, and
+// does it all as root of a filesystem it now believes it owns. Removal rather
+// than install because the sandbox has no network; it exercises the same
+// paths. The image keeps the package.
+func TestAPackageManagerCanChangeTheInstalledSet(t *testing.T) {
+	dir := scratchImage(t)
+	out, err := shIn(t, dir, "set -e; apk del --quiet libc-utils 2>/dev/null; "+
+		"apk info 2>/dev/null | grep -c '^libc-utils$' || true; "+
+		"test ! -e /usr/bin/getconf && echo getconf-gone")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	if out != "0\ngetconf-gone" {
+		t.Fatalf("output = %q, want the package gone from apk's database and its files from /usr", out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "usr/bin/getconf")); err != nil {
+		t.Fatalf("apk del reached the image on the host: %v", err)
+	}
+}
+
+// TestTheLayerCountsAgainstTheMemoryLimit is why there is no separate size
+// for it. tmpfs pages are charged to the cgroup of the process that writes
+// them, so a build filling its root filesystem meets the same limit and the
+// same OOM kill as one filling its heap.
+func TestTheLayerCountsAgainstTheMemoryLimit(t *testing.T) {
+	out, err := runSpec(t, Spec{
+		Rootfs:     scratchImage(t),
+		CgroupRoot: testCgroupRoot(t),
+		Limits:     cgroup.Limits{MemoryBytes: 16 << 20},
+		Args:       []string{"/bin/sh", "-c", "dd if=/dev/zero of=/usr/forge-blob bs=1M count=64 2>/dev/null && echo survived"},
+	})
+	if !errors.Is(err, ErrOOMKilled) {
+		t.Fatalf("err = %v, want it to wrap ErrOOMKilled (output %q)", err, out)
+	}
+	if strings.Contains(out, "survived") {
+		t.Fatalf("64MiB were written into the layer under a 16MiB limit: %q", out)
 	}
 }

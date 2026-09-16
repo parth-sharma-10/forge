@@ -23,6 +23,10 @@ func TestSpecValidate(t *testing.T) {
 		{"relative rootfs", Spec{Rootfs: "rootfs", Args: []string{"/bin/sh"}}, true},
 		{"missing rootfs", Spec{Rootfs: filepath.Join(dir, "absent"), Args: []string{"/bin/sh"}}, true},
 		{"rootfs is a file", Spec{Rootfs: file, Args: []string{"/bin/sh"}}, true},
+		// A separator in the path would be read as the end of an overlay
+		// mount option, and the mount would fail with a bare EINVAL.
+		{"comma in rootfs", Spec{Rootfs: separator(t, dir, "a,b"), Args: []string{"/bin/sh"}}, true},
+		{"colon in rootfs", Spec{Rootfs: separator(t, dir, "a:b"), Args: []string{"/bin/sh"}}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -42,4 +46,15 @@ func TestSpecValidateDefaultsHostname(t *testing.T) {
 	if spec.Hostname != defaultHostname {
 		t.Fatalf("hostname = %q, want %q", spec.Hostname, defaultHostname)
 	}
+}
+
+// separator makes a real directory whose name holds an overlay option
+// separator, so the test reaches the check rather than failing on Stat.
+func separator(t *testing.T, parent, name string) string {
+	t.Helper()
+	dir := filepath.Join(parent, name)
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return dir
 }

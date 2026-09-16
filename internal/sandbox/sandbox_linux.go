@@ -43,9 +43,9 @@ const namespaces = syscall.CLONE_NEWUSER | // user:    sandbox root is an unpriv
 // users for rootless podman and docker. Colliding with one of those is not a
 // hole in the sandbox; it makes a build's files show up owned by somebody.
 //
-// ponytail: one map for every job on the worker, so this is a boundary between
-// a build and the host, not between two builds. Per-job ranges when the overlay
-// rootfs lands and two builds can write to the same place.
+// One map for every job on the worker. Since the overlay no two jobs share a
+// writable filesystem, so per-job ranges would only separate what jobs own
+// on the host's side — which is nothing, today.
 const (
 	mappedBase  = 524288
 	mappedCount = 65536
@@ -151,6 +151,46 @@ func mountProc(rootfs string) error {
 	return nil
 }
 
+// mountOverlay puts a per-job writable layer over the image, at the image's
+// own path. The image is the overlay's lower layer and is never written: what
+// a build changes is copied up into upper/ on a tmpfs this process mounts in
+// its own mount namespace, so the layer exists nowhere on the host and is
+// gone the moment the namespace is — no directory to create, none to sweep.
+// The tmpfs pages are charged to the job's cgroup like any other memory it
+// touches, so Spec.Limits.MemoryBytes bounds the layer too.
+//
+// The tmpfs is mounted over the image path rather than somewhere else, so
+// the sandbox needs no host directory beyond the image itself. That covers
+// the image by name, which is why the working directory is moved there
+// first: a cwd is a reference to the directory, not to its path, and "."
+// keeps naming the image after the tmpfs has hidden it.
+//
+// userxattr: the overlay's own metadata — the mark on a directory that hides
+// its lower namesake — goes in user.* xattrs rather than trusted.*, which a
+// user namespace is not supposed to be able to set. On the Ubuntu kernels
+// this runs on it makes no difference anyone has observed (docs/decisions.md,
+// 2026-09-16); it is the documented option for a mount made from a user
+// namespace, and it is kept for the kernels that are not Ubuntu's.
+func mountOverlay(rootfs string) error {
+	if err := syscall.Chdir(rootfs); err != nil {
+		return fmt.Errorf("sandbox: chdir %s: %w", rootfs, err)
+	}
+	if err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, "mode=0755"); err != nil {
+		return fmt.Errorf("sandbox: mount scratch tmpfs on %s: %w", rootfs, err)
+	}
+	upper, work := filepath.Join(rootfs, "upper"), filepath.Join(rootfs, "work")
+	for _, dir := range []string{upper, work} {
+		if err := os.Mkdir(dir, 0o755); err != nil {
+			return fmt.Errorf("sandbox: %w", err)
+		}
+	}
+	opts := "lowerdir=.,upperdir=" + upper + ",workdir=" + work + ",userxattr"
+	if err := syscall.Mount("overlay", rootfs, "overlay", 0, opts); err != nil {
+		return fmt.Errorf("sandbox: mount overlay on %s: %w", rootfs, err)
+	}
+	return nil
+}
+
 // devNodes are the character devices a build expects to find. The major and
 // minor numbers are the kernel's, fixed in Documentation/admin-guide/devices.txt
 // — they are not chosen here and must not be invented.
@@ -193,10 +233,9 @@ var devLinks = [][2]string{
 // sandbox that can reach /dev/sda or /dev/mem is not a sandbox. The set is
 // exactly the six listed above.
 //
-// The tmpfs underneath is what keeps the nodes out of the rootfs image. Without
-// it the image's empty dev/ directory is writable, so a build redirecting to
-// /dev/null quietly creates a regular file of that name — in a directory the
-// next build on this worker will inherit.
+// The tmpfs underneath is what keeps the nodes out of the root filesystem.
+// Without it dev/ is an ordinary writable directory, so a build redirecting to
+// /dev/null quietly creates a regular file of that name.
 //
 // ponytail: no /dev/shm, /dev/ptmx or devpts. Nothing needs them until a build
 // wants a pty or POSIX shared memory; add them when one does.
@@ -265,10 +304,11 @@ func MaybeChild() {
 //
 //  1. make every mount private, or step 2 propagates back to the host and
 //     pivot_root refuses a shared new root;
-//  2. bind the rootfs onto itself, or pivot_root refuses a non-mount-point;
-//  3. mount /proc and /dev onto the rootfs while it is still a path on the
-//     host, because after step 4 neither can be done at all — see mountProc
-//     and mountDev for the two different reasons;
+//  2. put the per-job overlay over the image, which also makes the rootfs a
+//     mount point, or pivot_root refuses it — see mountOverlay;
+//  3. mount /proc and /dev onto the merged tree while it is still a path on
+//     the host, because after step 4 neither can be done at all — see
+//     mountProc and mountDev for the two different reasons;
 //  4. pivot_root, then detach the old root, so no path to the host remains
 //     (chroot alone would leave one — an open directory fd escapes it);
 //  5. install the seccomp filter last of all, since every step above uses
@@ -293,8 +333,8 @@ func child() error {
 	if err := syscall.Mount("none", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("sandbox: make mounts private: %w", err)
 	}
-	if err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
-		return fmt.Errorf("sandbox: bind rootfs %s: %w", rootfs, err)
+	if err := mountOverlay(rootfs); err != nil {
+		return err
 	}
 
 	if err := mountProc(rootfs); err != nil {
@@ -306,9 +346,9 @@ func child() error {
 
 	// pivot_root(".", ".") — the new root doubles as the place the old one is
 	// parked, stacked on top of it, so nothing has to be created inside the
-	// rootfs to hold it. That matters now that the image is owned by a uid
-	// this namespace does not map: a directory could not be made there, and
-	// the empty one left behind could not be removed.
+	// rootfs to hold it. Detaching the old root takes the tmpfs mount under
+	// the overlay with it; the layer lives on, because an overlay holds its
+	// own references to its layers rather than the paths they were named by.
 	if err := syscall.Chdir(rootfs); err != nil {
 		return fmt.Errorf("sandbox: chdir %s: %w", rootfs, err)
 	}
