@@ -236,6 +236,28 @@ to add it to a blocklist. `mount`, `pivot_root`, `mknod`, `ptrace`, `bpf`,
 rest of the kernel-facing surface are absent from the list and appear nowhere
 in the implementation.
 
+**`clone` is filtered on its flags** (Phase 1) — the one syscall with a
+second test. Its entry in the program loads the low word of `args[0]` and
+refuses the call with `EPERM` if any `CLONE_NEW*` bit is set, so a build can
+fork and create threads but not namespaces. `EPERM` and not `ENOSYS`, because
+the syscall is not missing — this use of it is, and that is what the kernel
+itself says to a process without the privilege. The legacy `clone` reads its
+flags from the low 32 bits only, so a mask over the low word is a mask over
+everything the kernel sees. `clone3` stays denied by number: its flags are
+in a struct the filter cannot read, and glibc's `ENOSYS` fallback is to
+`clone`, where they can be.
+
+**The capability bounding set is cut to nine** (Phase 1): chown,
+dac_override, fowner, fsetid, kill, setgid, setuid, net_bind_service,
+setfcap. `execve` for a root process confers the bounding set as the new
+permitted and effective sets, so dropping from it before the exec is the
+same as the build never having had the capability; `CAP_SETPCAP` is dropped
+last, because each drop needs it, and not kept, so the set cannot be changed
+again. The behavioural test is a raw socket, which needs `CAP_NET_RAW` in
+the namespace that owns the sandbox's network namespace — chosen because
+most of the obvious probes (`nice`, `sethostname`) are checked against the
+initial namespace, where this root never held anything to lose.
+
 **Denials return `ENOSYS`, not `EPERM`.** See docs/decisions.md; the short
 version is that `ENOSYS` is the one errno a C library treats as "fall back to
 the older syscall", so an allowlist that returns anything else breaks every
@@ -268,10 +290,11 @@ from another architecture's numbers.
 
 ## Next
 
-Phase 0's five named weeks are done, and Phase 1 has started with the per-job
-overlay. What is still open is written down rather than implied — argument
-filtering for `clone`, whose flags the number-only filter cannot bound; the
-capability bounding set; `/dev/ptmx` and `/dev/shm`; and a way for a build's
-output to leave the job, now that nothing it writes survives.
-[phase-0.md](phase-0.md) is Phase 0's definition of done and carries the list
-as it stood then.
+Phases 0 and 1 are done: the sandbox's primitives, and the three things
+Phase 0 left open about them — the per-job overlay, `clone`'s flags, the
+bounding set. [phase-1.md](phase-1.md) is Phase 1's definition of done.
+What is still open about the sandbox is small and named there: `/dev/ptmx`
+and `/dev/shm`, and a way for a build's output to leave the job. What comes
+next is above the sandbox — the worker's job loop against a queue, which is
+the first thing in the target shape at the top of this document that does
+not exist.
