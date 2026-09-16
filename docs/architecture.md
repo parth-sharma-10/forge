@@ -1,7 +1,8 @@
 # Forge — architecture
 
-Status: **Phase 0 complete** — see [phase-0.md](phase-0.md) for what that
-means and how it is checked. The bounded worker pool, the sandbox's namespace
+Status: **Phases 0, 1 and 2 complete** — see [phase-0.md](phase-0.md),
+[phase-1.md](phase-1.md) and [phase-2.md](phase-2.md) for what each means
+and how it is checked. The bounded worker pool, the sandbox's namespace
 isolation with a private device filesystem, per-job cgroups v2 resource limits,
 a deny-by-default seccomp filter, the user namespace and, from Phase 1, a
 per-job overlay root filesystem exist. This document
@@ -37,11 +38,42 @@ client / GitHub webhook
 
 ## Implemented
 
+### internal/queue — the job queue (Phase 2)
+
+One table, `jobs`, on PostgreSQL through `pgx/v5` — the first and only
+dependency. `Submit` inserts; `Claim` is a single `UPDATE ... WHERE id =
+(SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING` that takes the oldest
+queued job *or* the oldest whose lease has expired, marks it running under
+the worker, and hands back a lease deadline and a fencing token. `Heartbeat`
+extends the lease and `Report` writes the result, and both match the row
+only if the token is still the one that was handed out — a worker that lost
+its lease gets `ErrLeaseLost` from either and nothing it writes lands.
+`Get` reads a job back. Tests run against a real PostgreSQL, never a mock;
+under `CI` they fail rather than skip without one.
+
+### internal/worker — the job loop (Phase 2)
+
+`Serve` runs N loops. Each claims, runs the job through `sandbox.Run` with
+the worker's limits, heartbeats every third of the lease beside the build,
+and reports the exit status, the OOM distinction the sandbox makes, and the
+tail of the output. A lost lease cancels the build; the report still goes
+out and the queue refuses it. Two stops: closing `stop` drains — the job in
+hand finishes, no more are claimed — and cancelling the context kills the
+job in hand, which the sandbox turns into `SIGKILL` of its PID 1. The loop
+is tested against an in-memory store; the end-to-end test runs a submitted
+job through the real queue and the real sandbox and reads its exit status
+and log back.
+
+`forge-worker` is the binary: `-dsn`, `-rootfs`, `-workers`, `-lease`, the
+sandbox's limit flags, and the same two signals as before.
+
 ### internal/pool — bounded worker pool
 
-`Pool` runs `Task`s on a fixed set of goroutines. It is the concurrency
-primitive the worker will use for its job loop, so its shutdown semantics are
-the point of the package, not the fan-out.
+`Pool` runs `Task`s on a fixed set of goroutines. It was built as the
+concurrency primitive for the worker's job loop, and the loop, when it came
+in Phase 2, did not use it — see decisions.md, 2026-09-16. Its shutdown
+semantics are still the point of the package, not the fan-out, and they are
+the same two stops the worker has.
 
 Two distinct shutdown modes:
 

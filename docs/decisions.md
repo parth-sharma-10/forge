@@ -502,6 +502,60 @@ does. Most capability checks in the kernel are `capable()`, against the
 initial namespace, and a test of a dropped capability has to find one of the
 `ns_capable()` minority to prove anything.
 
+## 2026-09-16 — The queue is one PostgreSQL table, and pgx is the first dependency
+
+Phase 2's store. Parth chose `jackc/pgx/v5` over `lib/pq` (maintenance
+mode) and over SQLite-first (defers the dependency, not the decision, and
+writes the claim query twice). It is the only `require` in `go.mod`.
+
+**One table.** A job is a row; a run is an attempt on that row (`attempt`,
+`started_at`, `finished_at`, the result columns). The roadmap named three
+tables — jobs, runs, leases — and the honest minimum is one: a lease is two
+columns on the job, and a history of attempts is something Phase 4 may
+want and nothing yet reads.
+
+**`Claim` is one statement** — `UPDATE ... WHERE id = (SELECT ... FOR UPDATE
+SKIP LOCKED LIMIT 1) RETURNING` — and it takes an expired lease in the same
+`WHERE` as a queued job. Not Phase 4 pulled forward: a lease that nothing
+reclaims is a timestamp. There is no sweeper to requeue expired jobs, so
+there is no window in which a job is queued but not claimable, and no
+sweeper to fail to run.
+
+**A fencing token, not just a lease.** Every claim increments `fence`;
+every heartbeat and report names the token it was given and matches no row
+if the token has moved on. The worker that lost its lease still holds a
+`Job` and can still finish the build; the queue is what refuses the result.
+The alternative — trusting the worker to notice the lease expired — trusts
+a clock and a process that may have been paused for longer than the lease.
+
+**At-least-once.** A worker that dies after the build and before the report
+leaves a job to be run again. Phase 4 measures it. `Report` returning
+`ErrLeaseLost` is the visible edge of it today.
+
+**No attempt cap.** Marked `ponytail:` in the schema. Phase 4 owns it.
+
+## 2026-09-16 — The worker is N loops, and the pool is not one of them
+
+`worker.Serve` starts N goroutines, each claiming, running and reporting in
+turn. Phase 0 Week 1's `internal/pool` was built as "the concurrency
+primitive the worker will use for its job loop", and the loop does not use
+it: a pool runs tasks handed to it, and the claim has to happen *inside*
+the loop, when a slot is free, or a claimed job waits for a slot while its
+lease runs down. The two stops the pool was built for — drain and cancel —
+are a channel and a context here, which is what they were in the pool too.
+The pool stays for now; if Phase 5 finds nothing using it, it goes.
+
+**The lease is kept by a heartbeat beside the build**, every third of the
+lease, and a heartbeat that comes back `ErrLeaseLost` cancels the build:
+once another worker holds the job, this result can never be reported, and
+the only thing left to do with the build is stop paying for it. The report
+goes out on the worker's context, not the build's, so a build cancelled for
+a lost lease still tries to report and is told no by the queue.
+
+**The log is a tail**, the last `LogLimit` bytes of stdout and stderr
+interleaved, on the job row. The end of a build log is where the reason it
+failed is. Streaming is Phase 3.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that
