@@ -5,7 +5,7 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phases 0–4 of 5 complete** ([docs/phase-0.md](docs/phase-0.md) through [docs/phase-4.md](docs/phase-4.md)). What exists today is the sandbox —
+**Status: all five phases complete** ([docs/phase-0.md](docs/phase-0.md) through [docs/phase-5.md](docs/phase-5.md); [docs/deployment.md](docs/deployment.md) to run it). What exists is the sandbox —
 namespace isolation and a private device filesystem, per-job cgroups v2
 resource limits, a deny-by-default seccomp filter that also bounds `clone`'s
 flags, a user namespace that makes sandbox root an unprivileged uid on the
@@ -14,8 +14,9 @@ a capability bounding set cut to what a build needs — a worker that claims
 jobs from a PostgreSQL queue with leases and fencing tokens and runs them in
 it, and an HTTP API that submits jobs, reports them and streams their logs.
 More than one worker against the same queue is tested by killing one
-mid-job. What is left is Phase 5: metrics, a deployment document, and
-benchmark numbers. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
+mid-job. Both binaries expose Prometheus metrics, the deployment document
+has the systemd units, and the benchmark numbers below come from a harness
+in the repo. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented, [docs/decisions.md](docs/decisions.md) for why, and
 [docs/roadmap.md](docs/roadmap.md) for what "done" means.
 
@@ -27,6 +28,8 @@ make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
 make mutate        # break the sandbox 27 ways and check a test notices each
 make mutate-queue  # break the queue 4 ways, on the host, against FORGE_TEST_DSN
+make bench         # sandbox setup latency and jobs per second (Linux, root)
+make vm-bench      # the same, inside the colima VM
 ```
 
 The queue's tests run against a real PostgreSQL named by `FORGE_TEST_DSN`
@@ -214,6 +217,31 @@ on stops landing.
 `Ctrl-C` once drains — the jobs in hand finish, no more are claimed. Twice
 kills the jobs in hand.
 
+### Metrics
+
+`forge-api`'s `/metrics` reports the queue's depth by state; `forge-worker
+-metrics 127.0.0.1:9101` reports what it claimed, finished by outcome, gave
+up, lost the lease on, and has in hand. Prometheus text format, written by
+hand — no client library. [docs/deployment.md](docs/deployment.md) has the
+table and what each one rising means.
+
+### Numbers
+
+From `make vm-bench` on the development VM: colima, 2 vCPUs of an Apple
+Silicon host, 4 GB, Ubuntu kernel 6.8.0 aarch64, the Alpine image,
+PostgreSQL 16 on the same VM. Six runs of a hundred each; the ranges are
+the VM's variance, not a change in the code.
+
+| Benchmark | What it measures | Result |
+|---|---|---|
+| `BenchmarkRun` | one sandbox: six namespaces, overlay, `/proc`, `/dev`, `pivot_root`, bounding set, seccomp, `exec /bin/true`, teardown | 11–39 ms, median about 32 ms |
+| `BenchmarkRunWithLimits` | the same with a cgroup per job | 11–51 ms |
+| `BenchmarkThroughput` | jobs per second through the queue, four loops, `/bin/true` | 10–18 ms per job — 55–100 jobs/s |
+
+Most of a sandbox's cost is the mounts. The throughput benchmark first
+measured PostgreSQL, not Forge — see [docs/deployment.md](docs/deployment.md),
+*The table*.
+
 ```
 ^C
 level=INFO msg="signal received, draining: finishing jobs in hand, claiming no more"
@@ -226,6 +254,8 @@ level=INFO msg="worker exited cleanly"
 cmd/forge-api      HTTP API                      implemented
 cmd/forge-worker   job executor                  implemented
 internal/api       POST /jobs, GET, log streaming implemented
+internal/metrics   Prometheus text format         implemented
+deploy/            systemd units                  verified in CI
 cmd/forged         sandbox runtime               implemented
 internal/worker    claim, run, heartbeat, report implemented
 internal/pool      bounded worker pool           implemented, unused by the worker
@@ -234,7 +264,6 @@ internal/sandbox   namespaces, pivot_root, /dev  implemented
                    user namespace and id map     implemented
 internal/cgroup    cgroups v2 memory/cpu/pids    implemented
 internal/queue     PostgreSQL queue, leases      implemented
-internal/cas       content-addressed storage     (not built yet)
 docs/              architecture, decisions, failures
 ```
 
@@ -299,5 +328,5 @@ attempt count says it happened, and nothing makes the second run unnecessary
 The API has no authentication, no way to cancel or list jobs, and no
 webhook — a webhook is a client of `POST /jobs` and can live anywhere.
 
-There are no benchmark numbers — none will be quoted here until a harness
-produces them.
+The benchmark numbers above are from one small VM. They are what the
+harness produced there and nothing more.

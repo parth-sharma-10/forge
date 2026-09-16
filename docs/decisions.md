@@ -624,6 +624,40 @@ all caught. The harness's first VM mutant that hung a whole test run
 (2026-09-11) has a cousin here: a fake runner that ignores its context
 turned a failed assertion into a hung `Serve`. Fakes honour `ctx` now.
 
+## 2026-09-17 — Metrics by hand, benchmarks by `go test`, numbers with their machine
+
+**The Prometheus text format is written by hand.** A counter is a name, a
+help line, a type line and a number. The client library is for histograms,
+summaries and pushes, and Forge has none; the dependency count stays at
+one. `internal/metrics` is ninety lines and its tests pin the format. A
+value that lives in the database — the queue's depth — is sampled on each
+scrape; a sample that fails is absent from the output with a comment
+saying why, and the process's own counters are still there. The database
+being down must not take the worker's counters with it.
+
+**The benchmarks are `go test -bench`**, in the packages the code lives
+in, run the way the tests are run — root, image, database — and skipping
+without them. `BenchmarkRun` is the sandbox's whole setup and teardown
+around an exec of `/bin/true`; `BenchmarkThroughput` is jobs per second
+through the queue with four loops. The numbers are quoted with the
+machine, because a number without one is a claim.
+
+**What the throughput benchmark measured first was PostgreSQL.** Runs
+swung between 25 ms and 229 ms per job, single loop or four, with no
+change to the code. The table was carrying every earlier run's rows, each
+updated several times and never vacuumed; emptied, the benchmark settled
+at 10–18 ms. The benchmark empties the table now, and the deployment
+document says what to do about it in production — lower autovacuum's
+thresholds, and archive done rows. The sandbox itself, `BenchmarkRun`,
+reads 11–39 ms on the development VM, most of that the mounts, and the
+range is the VM's, not the code's: six runs of a hundred, no change
+between them but the host.
+
+**systemd, not a container, and the units are verified.** The sandbox
+needs a kernel and a delegated cgroup subtree; a container runtime is the
+thing Forge exists not to need. `deploy/*.service` pass `systemd-analyze
+verify` in CI with the binaries installed where the units say.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that

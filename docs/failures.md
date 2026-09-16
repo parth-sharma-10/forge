@@ -573,3 +573,33 @@ commit; a change elsewhere can turn a caught mutation into an equivalent one
 without touching either the test or the score anyone remembers. That is the
 argument for the harness living in the repo and running from `make`, rather
 than in a cache directory where it is run when someone thinks of it.
+
+## 2026-09-17 — The bounding-set test failed once, on a VM at load 169
+
+**Problem.** One `make vm-test` run out of the day's dozen failed
+`TestTheBoundingSetIsTheKeepList`: `CapPrm`, `CapEff` and `CapBnd` all read
+`0x00000000bffffeff` — every capability below 32 still held except
+`CAP_SETPCAP` (8) and `CAP_AUDIT_CONTROL` (30) — where `0x00000000800004fb`
+was expected. Run twice more on its own, it passed; the next full suite
+passed. No line of `sandbox_linux.go` had changed since the previous ten
+passes.
+
+**What the machine was doing.** The colima VM was also hosting another
+project's k3s cluster — a Java stack, node, minio — at a load average of
+169 on two vCPUs with 36 MB of memory free. The same run's
+`TestADroppedCapabilityIsGone` took 3.5 s against its usual 0.01 s, and the
+benchmarks swung threefold between runs.
+
+**Root cause.** Not found. The pattern — the drops of 8, 30 and 32–40 took
+effect and none of the others did — is not one a partial loop, a failed
+`prctl` (which returns an error the child exits on) or a mis-read
+`cap_last_cap` produces, and nothing in the kernel's `PR_CAPBSET_DROP` path
+is conditional on memory. The honest record is one unexplained failure on
+a machine that was not fit to measure anything, and a green CI on x86_64
+before and after.
+
+**Lesson.** Check the machine before reading a number from it: `free`,
+`uptime` and `ps --sort=-rss` first, then the benchmark. The benchmark
+numbers in the README are from CI's runner for that reason, with the VM's
+given beside them as what a loaded machine looks like. If this failure
+recurs on a quiet machine it is a bug, and this entry is where it starts.
