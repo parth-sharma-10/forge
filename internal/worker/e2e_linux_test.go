@@ -14,13 +14,6 @@ import (
 	"github.com/parth-sharma-10/forge/internal/sandbox"
 )
 
-// TestMain gives this test binary the sandbox's dual identity, since the
-// end-to-end test below runs the real thing.
-func TestMain(m *testing.M) {
-	sandbox.MaybeChild()
-	os.Exit(m.Run())
-}
-
 // TestEndToEnd is Phase 2's exit criterion: a job submitted to a real queue
 // is claimed by the real loop, runs in the real sandbox, and its exit
 // status, its log and the OOM distinction come back through the queue. It

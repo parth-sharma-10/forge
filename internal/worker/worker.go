@@ -48,6 +48,10 @@ type Worker struct {
 	// LogLimit is how many bytes of the build's output are kept — the tail,
 	// since the end of a build log is where the reason it failed is.
 	LogLimit int
+	// MaxAttempts is how many times a job may be claimed before a worker
+	// handed it reports it as given up instead of running it. A job that
+	// kills every worker it lands on would otherwise land forever.
+	MaxAttempts int
 
 	// Run executes one job. It is sandbox.Run unless a test says otherwise.
 	Run func(ctx context.Context, spec sandbox.Spec) error
@@ -55,10 +59,11 @@ type Worker struct {
 }
 
 const (
-	defaultLease    = 30 * time.Second
-	defaultPoll     = time.Second
-	defaultLogLimit = 1 << 20
-	maxFlush        = 2 * time.Second
+	defaultLease       = 30 * time.Second
+	defaultPoll        = time.Second
+	defaultLogLimit    = 1 << 20
+	defaultMaxAttempts = 3
+	maxFlush           = 2 * time.Second
 )
 
 func (w *Worker) heartbeatEvery() time.Duration {
@@ -74,6 +79,9 @@ func (w *Worker) defaults() {
 	}
 	if w.LogLimit == 0 {
 		w.LogLimit = defaultLogLimit
+	}
+	if w.MaxAttempts == 0 {
+		w.MaxAttempts = defaultMaxAttempts
 	}
 	if w.Run == nil {
 		w.Run = sandbox.Run
@@ -143,6 +151,18 @@ func (w *Worker) loop(ctx context.Context, stop <-chan struct{}) {
 // context — a build cancelled for a lost lease still tries to report, and
 // finds out it cannot.
 func (w *Worker) run(ctx context.Context, job queue.Job) {
+	// Enforced here rather than in the claim query: a job the query refused
+	// to hand out would sit running with an expired lease, a row nothing
+	// touches again. Handed out and reported, it is done, and says why.
+	if job.Attempt > w.MaxAttempts {
+		r := queue.Result{ExitCode: -1, Error: fmt.Sprintf("given up: attempt %d, limit %d", job.Attempt, w.MaxAttempts)}
+		if err := w.Store.Report(ctx, job, r); err != nil {
+			w.Log.Warn("report failed", "job", job.ID, "err", err)
+		}
+		w.Log.Warn("job given up", "job", job.ID, "attempt", job.Attempt)
+		return
+	}
+
 	buildCtx, cancelBuild := context.WithCancel(ctx)
 	defer cancelBuild()
 

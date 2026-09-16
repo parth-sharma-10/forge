@@ -50,8 +50,8 @@ func TestSubmitClaimReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if job.ID != id || len(job.Args) != 3 || job.Args[2] != "exit 3" || job.Fence != 1 {
-		t.Fatalf("claimed %+v, want job %d with its args and fence 1", job, id)
+	if job.ID != id || len(job.Args) != 3 || job.Args[2] != "exit 3" || job.Fence != 1 || job.Attempt != 1 {
+		t.Fatalf("claimed %+v, want job %d with its args, fence 1, attempt 1", job, id)
 	}
 	if until := time.Until(job.LeaseUntil); until < 50*time.Second || until > time.Minute {
 		t.Fatalf("lease runs out in %v, want about a minute", until)
@@ -150,8 +150,8 @@ func TestAnExpiredLeaseIsReclaimed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("claim after the lease expired: %v", err)
 	}
-	if second.ID != id || second.Fence != first.Fence+1 {
-		t.Fatalf("reclaimed %+v, want job %d with fence %d", second, id, first.Fence+1)
+	if second.ID != id || second.Fence != first.Fence+1 || second.Attempt != 2 {
+		t.Fatalf("reclaimed %+v, want job %d with fence %d, attempt 2", second, id, first.Fence+1)
 	}
 	if s, _ := q.Get(ctx, id); s.Attempt != 2 || s.Worker != "w2" {
 		t.Fatalf("after reclaim: %+v, want attempt 2 by w2", s)

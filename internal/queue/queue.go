@@ -128,11 +128,13 @@ func (q *Queue) Submit(ctx context.Context, args []string) (int64, error) {
 	return id, nil
 }
 
-// Job is a claimed job: what to run, and the token that proves the claim.
+// Job is a claimed job: what to run, the token that proves the claim, and
+// which attempt this is — the first, or one more after a worker died.
 type Job struct {
 	ID         int64
 	Args       []string
 	Fence      int64
+	Attempt    int
 	LeaseUntil time.Time
 }
 
@@ -157,8 +159,8 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 			ORDER BY id
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1)
-		RETURNING id, args, fence, lease_until`,
-		worker, lease).Scan(&j.ID, &j.Args, &j.Fence, &j.LeaseUntil)
+		RETURNING id, args, fence, attempt, lease_until`,
+		worker, lease).Scan(&j.ID, &j.Args, &j.Fence, &j.Attempt, &j.LeaseUntil)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, ErrEmpty
 	}
