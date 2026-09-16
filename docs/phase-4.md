@@ -42,7 +42,10 @@ exists for. Written before the code, as the phases before it were.
 
 ## Exit criteria
 
-1. CI green on x86_64 with the multi-worker tests running against the
-   service container, none skipped.
-2. `make mutate` still 27/27; `make mutate-queue` exits 0.
-3. `go.mod` still requires exactly one module.
+All three held on 2026-09-17 at the commit this file was last changed in.
+
+1. **CI green on x86_64** with the multi-worker tests running against the
+   service container — they fail rather than skip without one under `CI`
+   — and the privileged step at 72 passes, 0 skips, 0 failures.
+2. **`make mutate` 27/27; `make mutate-queue` 4/4**, exit 0.
+3. **`go.mod` requires exactly one module.**
