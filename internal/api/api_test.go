@@ -43,6 +43,16 @@ func (s *fakeStore) Get(_ context.Context, id int64) (queue.Status, error) {
 	return st, nil
 }
 
+func (s *fakeStore) Counts(context.Context) (map[string]int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	counts := map[string]int64{}
+	for _, st := range s.jobs {
+		counts[st.State]++
+	}
+	return counts, nil
+}
+
 // set is the worker's side: what a heartbeat or a report would have written.
 func (s *fakeStore) set(id int64, st queue.Status) {
 	s.mu.Lock()
@@ -202,5 +212,17 @@ func TestLogsSayWhenTheJobRestarted(t *testing.T) {
 	rest, _ := io.ReadAll(resp.Body)
 	if string(rest) != "\n[forge: job restarted, attempt 2]\nagain\n" {
 		t.Fatalf("after the restart: %q", rest)
+	}
+}
+
+func TestMetricsCountTheQueue(t *testing.T) {
+	srv, store := newServer(t)
+	post(t, srv.URL+"/jobs", `{"args": ["true"]}`)
+	post(t, srv.URL+"/jobs", `{"args": ["true"]}`)
+	store.set(2, queue.Status{State: "running"})
+	_, body := get(t, srv.URL+"/metrics")
+	want := "forge_queue_jobs{state=\"queued\"} 1\nforge_queue_jobs{state=\"running\"} 1\nforge_queue_jobs{state=\"done\"} 0\n"
+	if !strings.Contains(body, want) {
+		t.Fatalf("metrics =\n%s\nwant to contain\n%s", body, want)
 	}
 }

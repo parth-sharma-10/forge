@@ -75,6 +75,23 @@ func TestSubmitClaimReport(t *testing.T) {
 	}
 }
 
+func TestCountsByState(t *testing.T) {
+	q, ctx := open(t), context.Background()
+	if c, err := q.Counts(ctx); err != nil || c["queued"] != 0 || c["running"] != 0 || c["done"] != 0 {
+		t.Fatalf("counts of an empty queue: %v, %v", c, err)
+	}
+	q.Submit(ctx, []string{"true"})
+	q.Submit(ctx, []string{"true"})
+	job, _ := q.Claim(ctx, "w", time.Minute)
+	if c, _ := q.Counts(ctx); c["queued"] != 1 || c["running"] != 1 || c["done"] != 0 {
+		t.Fatalf("counts after one claim: %v", c)
+	}
+	q.Report(ctx, job, Result{})
+	if c, _ := q.Counts(ctx); c["queued"] != 1 || c["running"] != 0 || c["done"] != 1 {
+		t.Fatalf("counts after one report: %v", c)
+	}
+}
+
 func TestEmptyQueueAndUnknownJob(t *testing.T) {
 	q, ctx := open(t), context.Background()
 	if _, err := q.Claim(ctx, "w1", time.Minute); !errors.Is(err, ErrEmpty) {

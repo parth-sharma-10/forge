@@ -231,6 +231,26 @@ func (q *Queue) Report(ctx context.Context, job Job, r Result) error {
 	return nil
 }
 
+// Counts is how many jobs are in each state — the queue's depth, for a
+// scrape.
+func (q *Queue) Counts(ctx context.Context) (map[string]int64, error) {
+	rows, err := q.db.Query(ctx, `SELECT state, count(*) FROM jobs GROUP BY state`)
+	if err != nil {
+		return nil, fmt.Errorf("queue: counts: %w", err)
+	}
+	defer rows.Close()
+	counts := map[string]int64{"queued": 0, "running": 0, "done": 0}
+	for rows.Next() {
+		var state string
+		var n int64
+		if err := rows.Scan(&state, &n); err != nil {
+			return nil, fmt.Errorf("queue: counts: %w", err)
+		}
+		counts[state] = n
+	}
+	return counts, rows.Err()
+}
+
 // Status is a job as the queue sees it.
 type Status struct {
 	State   string // queued, running or done

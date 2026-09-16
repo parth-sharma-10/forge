@@ -12,12 +12,14 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
 	"github.com/parth-sharma-10/forge/internal/cgroup"
+	"github.com/parth-sharma-10/forge/internal/metrics"
 	"github.com/parth-sharma-10/forge/internal/queue"
 	"github.com/parth-sharma-10/forge/internal/sandbox"
 	"github.com/parth-sharma-10/forge/internal/worker"
@@ -39,6 +41,7 @@ func main() {
 		cpuCores   = flag.Float64("cpu", 0, "CPU limit per job in cores (0 for unlimited)")
 		maxPIDs    = flag.Int("pids", 0, "maximum processes per job (0 for unlimited)")
 		cgroupRoot = flag.String("cgroup-root", cgroup.DefaultRoot, "parent cgroup for the jobs' cgroups")
+		metricsAt  = flag.String("metrics", "", "address to serve /metrics on (empty for none)")
 	)
 	flag.Parse()
 	if *dsn == "" || *rootfs == "" {
@@ -71,10 +74,21 @@ func main() {
 		cancel()
 	}()
 
+	var reg metrics.Registry
+	if *metricsAt != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", &reg)
+		go func() {
+			if err := http.ListenAndServe(*metricsAt, mux); err != nil {
+				log.Error("metrics", "err", err)
+			}
+		}()
+	}
+
 	w := &worker.Worker{
 		Store: q, Name: *name, Rootfs: *rootfs, CgroupRoot: *cgroupRoot,
 		Limits: cgroup.Limits{MemoryBytes: *memoryMB << 20, CPUCores: *cpuCores, MaxPIDs: *maxPIDs},
-		Lease:  *lease, Poll: *poll, MaxAttempts: *attempts, Log: log,
+		Lease:  *lease, Poll: *poll, MaxAttempts: *attempts, Log: log, Metrics: &reg,
 	}
 	log.Info("worker started", "name", *name, "workers", *workers, "rootfs", *rootfs)
 	w.Serve(ctx, stop, *workers)
