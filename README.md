@@ -227,26 +227,24 @@ table and what each one rising means.
 
 ### Numbers
 
-From `make vm-bench` on the development VM: colima, 2 vCPUs of an Apple
-Silicon host, 4 GB, Ubuntu kernel 6.8.0 aarch64, the Alpine image,
-PostgreSQL 16 on the same VM. Six runs of a hundred each; the ranges are
-the VM's variance, not a change in the code.
+From `make bench` in CI on a GitHub-hosted `ubuntu-latest` runner (x86_64,
+Ubuntu kernel 6.x, `GOMAXPROCS` 2, PostgreSQL 17 in a service container,
+the Alpine image), one run of twenty iterations — the log of
+[PR #15](https://github.com/parth-sharma-10/forge/pull/15)'s `bench` step.
 
 | Benchmark | What it measures | Result |
 |---|---|---|
-| `BenchmarkRun` | one sandbox: six namespaces, overlay, `/proc`, `/dev`, `pivot_root`, bounding set, seccomp, `exec /bin/true`, teardown | 11–39 ms, median about 32 ms |
-| `BenchmarkRunWithLimits` | the same with a cgroup per job | 11–51 ms |
-| `BenchmarkThroughput` | jobs per second through the queue, four loops, `/bin/true` | 10–18 ms per job — 55–100 jobs/s |
+| `BenchmarkRun` | one sandbox: six namespaces, overlay, `/proc`, `/dev`, `pivot_root`, bounding set, seccomp, `exec /bin/true`, teardown | 5.9 ms |
+| `BenchmarkRunWithLimits` | the same with a cgroup per job | 5.8 ms |
+| `BenchmarkThroughput` | jobs per second through the queue and the sandbox, four loops, `/bin/true` | 10.1 ms per job — about 100 jobs/s |
 
-Most of a sandbox's cost is the mounts. The throughput benchmark first
-measured PostgreSQL, not Forge — see [docs/deployment.md](docs/deployment.md),
+The same benchmarks on the development VM — colima, 2 vCPUs, 4 GB, kernel
+6.8 aarch64 — read 11–39 ms per sandbox and 10–18 ms per job, and swung
+threefold between runs. The VM turned out to be hosting another project's
+Kubernetes cluster at a load average of 169; the numbers above are from
+the machine that was not. The throughput benchmark also first measured
+PostgreSQL rather than Forge — see [docs/deployment.md](docs/deployment.md),
 *The table*.
-
-```
-^C
-level=INFO msg="signal received, draining: finishing jobs in hand, claiming no more"
-level=INFO msg="worker exited cleanly"
-```
 
 ## Layout
 

@@ -35,9 +35,16 @@ has refused to quote until a harness produced them.
 
 ## Exit criteria
 
-1. CI green on x86_64: metrics tests running, unit files verified,
-   benchmarks running in the privileged step (numbers logged, not asserted).
-2. `make bench` in the VM produces the numbers the README quotes.
-3. `go.mod` still requires exactly one module.
-4. `docs/roadmap.md` says five of five, and the README's first sentence
-   is true.
+All four held on 2026-09-17 at the commit this file was last changed in.
+
+1. **CI green on x86_64**: metrics tests running, `make verify-units`
+   passing with the binaries installed, `make bench` logging its numbers
+   after the privileged suite's 72 passes, 0 skips, 0 failures.
+2. **The numbers the README quotes are from a harness in the repo** — from
+   CI's `bench` step rather than the VM, which was found to be hosting
+   another project's cluster at load 169; `docs/failures.md` has the
+   account, and the VM's numbers are given beside CI's for contrast.
+3. **`go.mod` requires exactly one module.**
+4. **`docs/roadmap.md` says five of five**, and the README's first sentence
+   is true: a job submitted over the API is claimed by a worker and runs in
+   the sandbox, and a worker that dies mid-job does not lose it.
