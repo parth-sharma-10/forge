@@ -35,8 +35,9 @@ var ErrLeaseLost = errors.New("queue: lease lost")
 var ErrNotFound = errors.New("queue: no such job")
 
 // schema is applied by Open. CREATE IF NOT EXISTS rather than a migration
-// tool: there is one table, and the day it needs a second shape is the day
-// a migration tool earns its place.
+// tool: there is one table. The ALTER at the end is the one column added
+// after the table first existed (Phase 3); a second one is when a
+// migration tool earns its place.
 //
 // ponytail: no attempt cap. A job that kills its worker every time is
 // reclaimed forever; Phase 4 owns the ceiling, with the runs history it
@@ -54,11 +55,13 @@ CREATE TABLE IF NOT EXISTS jobs (
 	oom_killed  boolean     NOT NULL DEFAULT false,
 	error       text        NOT NULL DEFAULT '',
 	log         bytea       NOT NULL DEFAULT '',
+	log_bytes   bigint      NOT NULL DEFAULT 0,
 	created_at  timestamptz NOT NULL DEFAULT now(),
 	started_at  timestamptz,
 	finished_at timestamptz
 );
 CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs (id) WHERE state <> 'done';
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS log_bytes bigint NOT NULL DEFAULT 0;
 `
 
 // Queue is a handle on the jobs table. It is safe for concurrent use.
@@ -66,17 +69,46 @@ type Queue struct {
 	db *pgxpool.Pool
 }
 
+// schemaLock is the advisory lock key the schema is applied under. Two
+// processes running CREATE TABLE IF NOT EXISTS at the same moment on a
+// fresh database do not both succeed — one of them hits the catalogue's
+// unique index — and the API and the worker start at the same moment on
+// every deployment. Measured, not supposed: the first run of both against
+// an empty database killed the worker with exactly that error.
+const schemaLock = 0x666f726765 // "forge"
+
 // Open connects to PostgreSQL and makes sure the table exists.
 func Open(ctx context.Context, dsn string) (*Queue, error) {
 	db, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("queue: %w", err)
 	}
-	if _, err := db.Exec(ctx, schema); err != nil {
+	// applySchema has released its connection by the time it returns;
+	// Close waits for every connection to come back, so it must not be
+	// called with one still held inside a deferred rollback.
+	if err := applySchema(ctx, db); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("queue: apply schema: %w", err)
+		return nil, err
 	}
 	return &Queue{db: db}, nil
+}
+
+func applySchema(ctx context.Context, db *pgxpool.Pool) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("queue: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, int64(schemaLock)); err != nil {
+		return fmt.Errorf("queue: schema lock: %w", err)
+	}
+	if _, err := tx.Exec(ctx, schema); err != nil {
+		return fmt.Errorf("queue: apply schema: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("queue: apply schema: %w", err)
+	}
+	return nil
 }
 
 // Close releases the connections. Leases held by this process are not
@@ -136,13 +168,22 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 	return j, nil
 }
 
-// Heartbeat extends the lease by lease from now. ErrLeaseLost means the
-// job was reclaimed: the worker should kill the build.
-func (q *Queue) Heartbeat(ctx context.Context, job Job, lease time.Duration) error {
+// Log is the build's output as the worker holds it: the last bytes, and
+// how many there have been in all, so a reader can tell how much of the
+// beginning is gone.
+type Log struct {
+	Tail  []byte
+	Total int64
+}
+
+// Heartbeat extends the lease by lease from now and stores the log so far.
+// ErrLeaseLost means the job was reclaimed: the worker should kill the
+// build.
+func (q *Queue) Heartbeat(ctx context.Context, job Job, lease time.Duration, log Log) error {
 	tag, err := q.db.Exec(ctx, `
-		UPDATE jobs SET lease_until = now() + $3
+		UPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5
 		WHERE id = $1 AND fence = $2 AND state = 'running'`,
-		job.ID, job.Fence, lease)
+		job.ID, job.Fence, lease, log.Tail, log.Total)
 	if err != nil {
 		return fmt.Errorf("queue: heartbeat: %w", err)
 	}
@@ -163,8 +204,8 @@ type Result struct {
 	// Error is set when the build did not run to an exit status of its own:
 	// the sandbox failed to build, or the job was cancelled.
 	Error string
-	// Log is the tail of the build's stdout and stderr.
-	Log []byte
+	// Log is the build's stdout and stderr, interleaved.
+	Log Log
 }
 
 // Report marks the job done with r. ErrLeaseLost means another worker holds
@@ -174,10 +215,11 @@ type Result struct {
 func (q *Queue) Report(ctx context.Context, job Job, r Result) error {
 	tag, err := q.db.Exec(ctx, `
 		UPDATE jobs
-		SET state = 'done', exit_code = $3, oom_killed = $4, error = $5, log = COALESCE($6, ''::bytea),
+		SET state = 'done', exit_code = $3, oom_killed = $4, error = $5,
+		    log = COALESCE($6, ''::bytea), log_bytes = $7,
 		    finished_at = now(), lease_until = NULL
 		WHERE id = $1 AND fence = $2 AND state = 'running'`,
-		job.ID, job.Fence, r.ExitCode, r.OOMKilled, r.Error, r.Log)
+		job.ID, job.Fence, r.ExitCode, r.OOMKilled, r.Error, r.Log.Tail, r.Log.Total)
 	if err != nil {
 		return fmt.Errorf("queue: report: %w", err)
 	}
@@ -192,7 +234,9 @@ type Status struct {
 	State   string // queued, running or done
 	Attempt int
 	Worker  string
-	Result  Result // meaningful once State is done
+	// Result is complete once State is done. While the job runs, Result.Log
+	// is what the worker has flushed so far.
+	Result Result
 }
 
 // Get reads a job's state.
@@ -200,9 +244,10 @@ func (q *Queue) Get(ctx context.Context, id int64) (Status, error) {
 	var s Status
 	var exit *int
 	err := q.db.QueryRow(ctx, `
-		SELECT state, attempt, worker, exit_code, oom_killed, error, log
+		SELECT state, attempt, worker, exit_code, oom_killed, error, log, log_bytes
 		FROM jobs WHERE id = $1`, id).
-		Scan(&s.State, &s.Attempt, &s.Worker, &exit, &s.Result.OOMKilled, &s.Result.Error, &s.Result.Log)
+		Scan(&s.State, &s.Attempt, &s.Worker, &exit, &s.Result.OOMKilled, &s.Result.Error,
+			&s.Result.Log.Tail, &s.Result.Log.Total)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Status{}, ErrNotFound
 	}

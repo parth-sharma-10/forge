@@ -26,7 +26,7 @@ import (
 // database.
 type Store interface {
 	Claim(ctx context.Context, worker string, lease time.Duration) (queue.Job, error)
-	Heartbeat(ctx context.Context, job queue.Job, lease time.Duration) error
+	Heartbeat(ctx context.Context, job queue.Job, lease time.Duration, log queue.Log) error
 	Report(ctx context.Context, job queue.Job, r queue.Result) error
 }
 
@@ -40,8 +40,10 @@ type Worker struct {
 	// CgroupRoot is passed through to the sandbox; empty means the default.
 	CgroupRoot string
 
-	// Lease is how long a claim holds without a heartbeat; heartbeats go
-	// out every third of it. Poll is the sleep after an empty claim.
+	// Lease is how long a claim holds without a heartbeat. Heartbeats go
+	// out every third of it or every two seconds, whichever is sooner —
+	// each one carries the log so far, and that is how stale a followed
+	// log can be. Poll is the sleep after an empty claim.
 	Lease, Poll time.Duration
 	// LogLimit is how many bytes of the build's output are kept — the tail,
 	// since the end of a build log is where the reason it failed is.
@@ -56,7 +58,12 @@ const (
 	defaultLease    = 30 * time.Second
 	defaultPoll     = time.Second
 	defaultLogLimit = 1 << 20
+	maxFlush        = 2 * time.Second
 )
+
+func (w *Worker) heartbeatEvery() time.Duration {
+	return min(w.Lease/3, maxFlush)
+}
 
 func (w *Worker) defaults() {
 	if w.Lease == 0 {
@@ -130,17 +137,20 @@ func (w *Worker) loop(ctx context.Context, stop <-chan struct{}) {
 //
 // The heartbeat runs beside the build and cancels it on a lost lease: once
 // another worker holds the job, this build's result can never be reported,
-// so the only thing left to do with it is stop paying for it. The report
-// itself goes out on ctx, not the build's context — a build cancelled for a
-// lost lease still tries to report, and finds out it cannot.
+// so the only thing left to do with it is stop paying for it. Each
+// heartbeat carries the log so far, which is what lets a reader follow a
+// build while it runs. The report itself goes out on ctx, not the build's
+// context — a build cancelled for a lost lease still tries to report, and
+// finds out it cannot.
 func (w *Worker) run(ctx context.Context, job queue.Job) {
 	buildCtx, cancelBuild := context.WithCancel(ctx)
 	defer cancelBuild()
 
+	log := &tail{limit: w.LogLimit}
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
-		t := time.NewTicker(w.Lease / 3)
+		t := time.NewTicker(w.heartbeatEvery())
 		defer t.Stop()
 		for {
 			select {
@@ -148,7 +158,7 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 				return
 			case <-t.C:
 			}
-			if err := w.Store.Heartbeat(ctx, job, w.Lease); err != nil {
+			if err := w.Store.Heartbeat(ctx, job, w.Lease, log.Log()); err != nil {
 				w.Log.Warn("heartbeat failed, killing the build", "job", job.ID, "err", err)
 				cancelBuild()
 				return
@@ -156,7 +166,6 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		}
 	}()
 
-	log := &tail{limit: w.LogLimit}
 	err := w.Run(buildCtx, sandbox.Spec{
 		Rootfs:     w.Rootfs,
 		Args:       job.Args,
@@ -169,7 +178,7 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 	<-heartbeatDone
 
 	r := result(err)
-	r.Log = log.Bytes()
+	r.Log = log.Log()
 	if err := w.Store.Report(ctx, job, r); err != nil {
 		w.Log.Warn("report failed", "job", job.ID, "err", err)
 		return
@@ -200,7 +209,7 @@ func result(err error) queue.Result {
 	}
 }
 
-// tail keeps the last limit bytes written to it.
+// tail keeps the last limit bytes written to it, and counts them all.
 //
 // ponytail: a copy on every overflow rather than a ring, so a build that
 // writes far more than the limit pays O(n) per write past it. Trade for a
@@ -208,6 +217,7 @@ func result(err error) queue.Result {
 type tail struct {
 	mu    sync.Mutex
 	buf   []byte
+	total int64
 	limit int
 }
 
@@ -215,14 +225,15 @@ func (t *tail) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.buf = append(t.buf, p...)
+	t.total += int64(len(p))
 	if len(t.buf) > t.limit {
 		t.buf = append(t.buf[:0], t.buf[len(t.buf)-t.limit:]...)
 	}
 	return len(p), nil
 }
 
-func (t *tail) Bytes() []byte {
+func (t *tail) Log() queue.Log {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return append([]byte(nil), t.buf...)
+	return queue.Log{Tail: append([]byte(nil), t.buf...), Total: t.total}
 }
