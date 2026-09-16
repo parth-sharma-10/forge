@@ -5,15 +5,16 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phases 0, 1 and 2 of 5 complete** ([docs/phase-0.md](docs/phase-0.md), [docs/phase-1.md](docs/phase-1.md), [docs/phase-2.md](docs/phase-2.md)). What exists today is the sandbox —
+**Status: Phases 0–3 of 5 complete** ([docs/phase-0.md](docs/phase-0.md), [docs/phase-1.md](docs/phase-1.md), [docs/phase-2.md](docs/phase-2.md), [docs/phase-3.md](docs/phase-3.md)). What exists today is the sandbox —
 namespace isolation and a private device filesystem, per-job cgroups v2
 resource limits, a deny-by-default seccomp filter that also bounds `clone`'s
 flags, a user namespace that makes sandbox root an unprivileged uid on the
 host, a per-job overlay so each build gets its own writable root filesystem,
-a capability bounding set cut to what a build needs — and a worker that
-claims jobs from a PostgreSQL queue with leases and fencing tokens and runs
-them in it. The API and everything with more than one worker are not built
-yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
+a capability bounding set cut to what a build needs — a worker that claims
+jobs from a PostgreSQL queue with leases and fencing tokens and runs them in
+it, and an HTTP API that submits jobs, reports them and streams their logs.
+More than one worker against the same queue is written for but not yet
+tested by killing one; that is Phase 4. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented, [docs/decisions.md](docs/decisions.md) for why, and
 [docs/roadmap.md](docs/roadmap.md) for what "done" means.
 
@@ -163,26 +164,34 @@ The layer's pages are charged to the job's cgroup like the rest of its memory,
 so `-memory-mb` bounds it too; a job that writes 64 MiB into `/usr` under a
 16 MiB limit is OOM-killed the same way one that allocates 64 MiB is.
 
-### The worker and the queue
+### The worker, the queue and the API
 
 A job is a row in PostgreSQL. `forge-worker` claims one with `FOR UPDATE SKIP
 LOCKED`, holds a lease on it by heartbeating, runs it in the sandbox, and
 writes back the exit status, whether the memory limit killed it, and the tail
-of its output. The table is created on first connection; until the API lands
-in Phase 3, `psql` is how a job goes in.
+of its output — with every heartbeat while it runs, so the log can be
+followed. `forge-api` is the front door: it needs no privileges and never
+touches the sandbox. The table is created by whichever connects first.
 
 ```
+$ forge-api -dsn "$DSN" -listen 127.0.0.1:18080 &
 $ sudo forge-worker -dsn "$DSN" -rootfs /var/tmp/forge-rootfs -workers 2 -memory-mb 64 &
-$ psql "$DSN" -c "INSERT INTO jobs (args) VALUES ('{/bin/sh,-c,\"echo building; hostname; exit 3\"}')"
-INSERT 0 1
-$ psql "$DSN" -c "SELECT id, state, worker, attempt, exit_code, oom_killed, convert_from(log, 'UTF8') AS log FROM jobs"
- id | state | worker | attempt | exit_code | oom_killed |   log
-----+-------+--------+---------+-----------+------------+----------
-  1 | done  | colima |       1 |         3 | f          | building+
-    |       |        |         |           |            | forge   +
-    |       |        |         |           |            |
-(1 row)
+$ curl -s -X POST 127.0.0.1:18080/jobs -d '{"args": ["/bin/sh", "-c", "for i in 1 2 3; do echo step $i; sleep 1; done; exit 3"]}'
+{"id":1}
+$ curl -sN 127.0.0.1:18080/jobs/1/logs        # streams; each line arrived a second apart
+step 1
+step 2
+step 3
+$ curl -s 127.0.0.1:18080/jobs/1
+{"id":1,"state":"done","attempt":1,"worker":"colima","exit_code":3,"oom_killed":false,"log_bytes":21}
 ```
+
+`GET /jobs/{id}/logs` follows a running job by re-reading its row every half
+second and writing what is new, and returns at once for a job that is done.
+The row holds the last megabyte of output; a follower that missed more than
+that is told how many bytes, rather than shown a splice. The API trusts its
+network — there is no authentication — and is meant to sit behind whatever
+provides it.
 
 Every claim hands out a fencing token, and every heartbeat and report names
 it. A worker whose lease expired — paused, partitioned, or just slow — still
@@ -203,8 +212,9 @@ level=INFO msg="worker exited cleanly"
 ## Layout
 
 ```
-cmd/forge-api      HTTP API                      (not built yet)
+cmd/forge-api      HTTP API                      implemented
 cmd/forge-worker   job executor                  implemented
+internal/api       POST /jobs, GET, log streaming implemented
 cmd/forged         sandbox runtime               implemented
 internal/worker    claim, run, heartbeat, report implemented
 internal/pool      bounded worker pool           implemented, unused by the worker
@@ -275,5 +285,8 @@ the report leaves a job whose lease expires and is run again; nothing
 records that it happened twice. Phase 4 is where more than one worker is
 tested, and where that gets measured.
 
-There is also still no API, and no benchmark numbers — none will be quoted
-here until a harness produces them.
+The API has no authentication, no way to cancel or list jobs, and no
+webhook — a webhook is a client of `POST /jobs` and can live anywhere.
+
+There are no benchmark numbers — none will be quoted here until a harness
+produces them.

@@ -556,6 +556,40 @@ a lost lease still tries to report and is told no by the queue.
 interleaved, on the job row. The end of a build log is where the reason it
 failed is. Streaming is Phase 3.
 
+## 2026-09-16 — Logs ride the heartbeat, and following is polling
+
+The worker already writes the job's row every few seconds to keep its
+lease; the log tail goes in the same statement, with the total byte count
+beside it. No log table, no second connection, no second goroutine, and a
+followed log is at most one heartbeat stale — two seconds, or a third of
+the lease if that is shorter. `GET /jobs/{id}/logs` re-reads the row every
+half second and writes what is new, by comparing totals. Rejected:
+LISTEN/NOTIFY, which cuts the latency nothing needs cut and adds a second
+path to keep the first honest.
+
+**Truncation is announced, not hidden.** The row holds a tail; a follower
+whose last total is further behind than the tail is long is told how many
+bytes it missed. A total that went *down* is another worker's attempt
+starting from nothing, and is announced as a restart. Both were chosen over
+the silent splice that "just send the suffix" produces.
+
+## 2026-09-16 — Schema application takes an advisory lock
+
+`CREATE TABLE IF NOT EXISTS` is not safe against itself: two sessions that
+both find no table both try to create it, and one loses on the catalogue's
+unique index. The API and the worker connect at the same moment on every
+fresh deployment, and the first time they did, the worker died with exactly
+that error. `Open` now applies the schema inside a transaction that holds
+`pg_advisory_xact_lock` first. `TestConcurrentOpensOnAFreshDatabase` drops
+the table and opens eight at once; with the lock removed it fails three
+runs out of three.
+
+The same test found that `Open`'s error path hung: it closed the pool
+while its deferred rollback still held the connection, and `pgxpool.Close`
+waits for every connection to come back. A schema failure of any kind —
+missing grants, say — would have been a daemon that never started and
+never said why. The transaction is now released before the pool is closed.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that
