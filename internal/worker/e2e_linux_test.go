@@ -11,7 +11,6 @@ import (
 
 	"github.com/parth-sharma-10/forge/internal/cgroup"
 	"github.com/parth-sharma-10/forge/internal/queue"
-	"github.com/parth-sharma-10/forge/internal/sandbox"
 )
 
 // TestEndToEnd is Phase 2's exit criterion: a job submitted to a real queue
