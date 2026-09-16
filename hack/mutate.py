@@ -6,7 +6,8 @@ built with the mutation applied, run as root inside the VM, and the mutation is
 CAUGHT if the run fails and MISSED if the suite still passes. A missed
 mutation is a test that proves nothing, and the harness exits non-zero on it.
 
-    make mutate                       # every mutation
+    make mutate                       # every sandbox mutation, in the VM
+    make mutate-queue                 # the queue's, on the host, against FORGE_TEST_DSN
     hack/mutate.py identity-map       # just the ones named
 
 Three traps this harness guards against, each of which has cost a session
@@ -33,6 +34,7 @@ FORGE = pathlib.Path(__file__).resolve().parent.parent
 SANDBOX = "internal/sandbox/sandbox_linux.go"
 SECCOMP = "internal/sandbox/seccomp_linux.go"
 SECCOMP_ARM64 = "internal/sandbox/seccomp_linux_arm64.go"
+QUEUE = "internal/queue/queue.go"
 BINDIR = pathlib.Path.home() / ".cache/forge/mut"
 ROOTFS = os.environ.get("FORGE_TEST_ROOTFS", "/var/tmp/forge-rootfs")
 VM = os.environ.get("VM", "colima")
@@ -243,12 +245,78 @@ MUTATIONS = [
     ),
 ]
 
+# The queue's mutations run on the host against FORGE_TEST_DSN: they need
+# PostgreSQL and no privileges. Same shape, different target.
+QUEUE_MUTATIONS = [
+    # Report matches the row without the fencing token, so a worker that
+    # lost its lease can overwrite the result of the one that took the job.
+    # The clause replacing it is typed: `$2 = $2` on its own is a parameter
+    # PostgreSQL cannot infer, and the statement errors instead of landing.
+    (
+        "report-without-fence",
+        QUEUE,
+        "\t\t    finished_at = now(), lease_until = NULL\n"
+        "\t\tWHERE id = $1 AND fence = $2 AND state = 'running'`,",
+        "\t\t    finished_at = now(), lease_until = NULL\n"
+        "\t\tWHERE id = $1 AND $2::bigint >= 0 AND state = 'running'`,",
+    ),
+    # Heartbeat likewise: a stale worker keeps extending a lease it lost.
+    (
+        "heartbeat-without-fence",
+        QUEUE,
+        "\t\tUPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5\n"
+        "\t\tWHERE id = $1 AND fence = $2 AND state = 'running'`,",
+        "\t\tUPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5\n"
+        "\t\tWHERE id = $1 AND $2::bigint >= 0 AND state = 'running'`,",
+    ),
+    # An expired lease is never reclaimed: a dead worker's job is stuck.
+    (
+        "no-reclaim",
+        QUEUE,
+        "\t\t\tWHERE state = 'queued' OR (state = 'running' AND lease_until < now())\n",
+        "\t\t\tWHERE state = 'queued'\n",
+    ),
+    # The schema applied without the advisory lock: two processes starting
+    # together on a fresh database race on CREATE TABLE IF NOT EXISTS.
+    (
+        "no-schema-lock",
+        QUEUE,
+        "`SELECT pg_advisory_xact_lock($1)`",
+        "`SELECT $1::bigint`",
+    ),
+]
+
 
 def build(binary):
     env = dict(os.environ, GOOS="linux", GOARCH=GOARCH)
     return subprocess.run(
         ["go", "test", "-c", "-o", str(binary), "./internal/sandbox"],
         cwd=FORGE, env=env, capture_output=True, text=True,
+    )
+
+
+def build_host(binary):
+    return subprocess.run(
+        ["go", "test", "-c", "-o", str(binary), "./internal/queue"],
+        cwd=FORGE, capture_output=True, text=True,
+    )
+
+
+def run_on_host(binary):
+    # The queue's own tests, and the worker's multi-worker tests, are what
+    # notice these; the worker package is run from source since the
+    # mutation is in the queue package it imports.
+    if not os.environ.get("FORGE_TEST_DSN"):
+        sys.exit("FORGE_TEST_DSN is not set: the queue mutations need a PostgreSQL")
+    first = subprocess.run(
+        [str(binary), "-test.count=1", "-test.timeout=120s"],
+        cwd=FORGE, capture_output=True, text=True,
+    )
+    if first.returncode != 0:
+        return first
+    return subprocess.run(
+        ["go", "test", "-count=1", "-timeout=120s", "./internal/worker"],
+        cwd=FORGE, capture_output=True, text=True,
     )
 
 
@@ -268,12 +336,15 @@ def failing_tests(output):
 
 
 def main():
-    only = set(sys.argv[1:])
-    originals = {rel: (FORGE / rel).read_text() for _, rel, _, _ in MUTATIONS}
+    args = sys.argv[1:]
+    on_host = "--queue" in args
+    only = set(a for a in args if a != "--queue")
+    mutations = QUEUE_MUTATIONS if on_host else MUTATIONS
+    originals = {rel: (FORGE / rel).read_text() for _, rel, _, _ in mutations}
     BINDIR.mkdir(parents=True, exist_ok=True)
     results, harness_errors = [], []
     try:
-        for name, rel, old, new in MUTATIONS:
+        for name, rel, old, new in mutations:
             if only and name not in only:
                 continue
             path, source = FORGE / rel, originals[rel]
@@ -283,11 +354,11 @@ def main():
             path.write_text(source.replace(old, new, 1))
             try:
                 binary = BINDIR / f"{BATCH}-{name}.test"
-                built = build(binary)
+                built = build_host(binary) if on_host else build(binary)
                 if built.returncode != 0 or not binary.exists():
                     harness_errors.append(f"{name}: does not compile\n{built.stderr.strip()[:400]}")
                     continue
-                got = run_in_vm(binary)
+                got = run_on_host(binary) if on_host else run_in_vm(binary)
             finally:
                 path.write_text(source)
             caught = got.returncode != 0

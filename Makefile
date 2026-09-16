@@ -26,7 +26,7 @@ VM_WORKER_BIN = $(HOME)/.cache/forge/worker.test
 FORGE_TEST_DSN ?=
 VM_DSN ?= postgres://forge:forge@127.0.0.1:5432/forge
 
-.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate
+.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate mutate-queue
 
 all: test
 
@@ -113,3 +113,7 @@ vm-shell:
 # still passes; the score in docs/phase-0.md comes from this and nowhere else.
 mutate:
 	VM=$(VM) FORGE_TEST_ROOTFS=$(ROOTFS) hack/mutate.py
+
+## mutate-queue: the same for the queue, on the host, against FORGE_TEST_DSN
+mutate-queue:
+	FORGE_TEST_DSN=$(FORGE_TEST_DSN) hack/mutate.py --queue
