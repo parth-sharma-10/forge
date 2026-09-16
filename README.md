@@ -12,7 +12,8 @@ cgroups v2 resource limits, a deny-by-default seccomp filter that also bounds
 on the host, a per-job overlay so each build gets its own writable root
 filesystem, and a capability bounding set cut to what a build needs. The API,
 the queue and everything distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
-implemented and [docs/decisions.md](docs/decisions.md) for why.
+implemented, [docs/decisions.md](docs/decisions.md) for why, and
+[docs/roadmap.md](docs/roadmap.md) for what "done" means.
 
 ## Quickstart
 
