@@ -1,0 +1,25 @@
+# forge-worker: claims jobs and runs them in the sandbox. Root, because the
+# sandbox is built from clone flags and mounts that need CAP_SYS_ADMIN on the
+# host side; the build itself runs as an unprivileged uid inside. Delegate=
+# hands this unit's cgroup subtree to the worker, which is where each job's
+# cgroup goes; without it systemd owns the tree and cgroup.Create fails.
+# Set FORGE_DSN in /etc/forge/worker.env. The image at /var/lib/forge/rootfs
+# must have been shifted into the sandbox's uid map: `make rootfs` does it,
+# and hack/shift-rootfs.sh is the one step for an image unpacked by hand.
+[Unit]
+Description=Forge worker
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/forge/worker.env
+ExecStart=/usr/local/bin/forge-worker -rootfs /var/lib/forge/rootfs -workers 4 -memory-mb 2048 -pids 512 -cgroup-root /sys/fs/cgroup/system.slice/forge-worker.service -metrics 127.0.0.1:9101
+Delegate=yes
+# First SIGTERM drains; systemd sends a second on a slow stop, which kills.
+KillMode=mixed
+TimeoutStopSec=300
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target
