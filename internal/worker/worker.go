@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/parth-sharma-10/forge/internal/cgroup"
+	"github.com/parth-sharma-10/forge/internal/metrics"
 	"github.com/parth-sharma-10/forge/internal/queue"
 	"github.com/parth-sharma-10/forge/internal/sandbox"
 )
@@ -56,7 +57,17 @@ type Worker struct {
 	// Run executes one job. It is sandbox.Run unless a test says otherwise.
 	Run func(ctx context.Context, spec sandbox.Spec) error
 	Log *slog.Logger
+	// Metrics is where the counters are registered; nil means a registry
+	// of the worker's own that nothing scrapes.
+	Metrics *metrics.Registry
+
+	claimed, leaseLost *metrics.Counter
+	done               map[string]*metrics.Counter
+	running            *metrics.Gauge
 }
+
+// outcomes are the labels of forge_jobs_done_total.
+var outcomes = []string{"ok", "failed", "oom", "killed", "setup", "given_up"}
 
 const (
 	defaultLease       = 30 * time.Second
@@ -88,6 +99,16 @@ func (w *Worker) defaults() {
 	}
 	if w.Log == nil {
 		w.Log = slog.Default()
+	}
+	if w.Metrics == nil {
+		w.Metrics = &metrics.Registry{}
+	}
+	w.claimed = w.Metrics.Counter("forge_jobs_claimed_total", "Jobs claimed from the queue.", nil)
+	w.leaseLost = w.Metrics.Counter("forge_lease_lost_total", "Heartbeats refused: the job had been reclaimed.", nil)
+	w.running = w.Metrics.Gauge("forge_jobs_running", "Jobs in hand right now.", nil)
+	w.done = map[string]*metrics.Counter{}
+	for _, o := range outcomes {
+		w.done[o] = w.Metrics.Counter("forge_jobs_done_total", "Jobs reported, by outcome.", map[string]string{"outcome": o})
 	}
 }
 
@@ -151,6 +172,7 @@ func (w *Worker) loop(ctx context.Context, stop <-chan struct{}) {
 // context — a build cancelled for a lost lease still tries to report, and
 // finds out it cannot.
 func (w *Worker) run(ctx context.Context, job queue.Job) {
+	w.claimed.Inc()
 	// Enforced here rather than in the claim query: a job the query refused
 	// to hand out would sit running with an expired lease, a row nothing
 	// touches again. Handed out and reported, it is done, and says why.
@@ -159,10 +181,13 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		if err := w.Store.Report(ctx, job, r); err != nil {
 			w.Log.Warn("report failed", "job", job.ID, "err", err)
 		}
+		w.done["given_up"].Inc()
 		w.Log.Warn("job given up", "job", job.ID, "attempt", job.Attempt)
 		return
 	}
 
+	w.running.Inc()
+	defer w.running.Dec()
 	buildCtx, cancelBuild := context.WithCancel(ctx)
 	defer cancelBuild()
 
@@ -179,6 +204,9 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 			case <-t.C:
 			}
 			if err := w.Store.Heartbeat(ctx, job, w.Lease, log.Log()); err != nil {
+				if errors.Is(err, queue.ErrLeaseLost) {
+					w.leaseLost.Inc()
+				}
 				w.Log.Warn("heartbeat failed, killing the build", "job", job.ID, "err", err)
 				cancelBuild()
 				return
@@ -199,11 +227,27 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 
 	r := result(err)
 	r.Log = log.Log()
+	w.done[outcome(r)].Inc()
 	if err := w.Store.Report(ctx, job, r); err != nil {
 		w.Log.Warn("report failed", "job", job.ID, "err", err)
 		return
 	}
 	w.Log.Info("job done", "job", job.ID, "exit", r.ExitCode, "oom", r.OOMKilled, "error", r.Error)
+}
+
+// outcome names a result for the counter.
+func outcome(r queue.Result) string {
+	switch {
+	case r.OOMKilled:
+		return "oom"
+	case r.ExitCode == sandbox.SetupExitCode:
+		return "setup"
+	case r.ExitCode == -1:
+		return "killed"
+	case r.ExitCode == 0:
+		return "ok"
+	}
+	return "failed"
 }
 
 // result turns what the sandbox returned into what the queue records.

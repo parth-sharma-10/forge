@@ -4,6 +4,7 @@
 //	POST /jobs            {"args": ["/bin/sh", "-c", "make"]}  -> 201 {"id": 7}
 //	GET  /jobs/{id}                                            -> 200 job JSON, 404
 //	GET  /jobs/{id}/logs                                       -> 200 text/plain, streamed until the job is done
+//	GET  /metrics                                              -> the queue's depth by state, Prometheus text format
 //
 // The API trusts its network: there is no authentication. It is meant to
 // sit behind whatever does that, and the README says so.
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/parth-sharma-10/forge/internal/metrics"
 	"github.com/parth-sharma-10/forge/internal/queue"
 )
 
@@ -25,6 +27,7 @@ import (
 type Store interface {
 	Submit(ctx context.Context, args []string) (int64, error)
 	Get(ctx context.Context, id int64) (queue.Status, error)
+	Counts(ctx context.Context) (map[string]int64, error)
 }
 
 // followEvery is how often a followed log re-reads the row. The worker
@@ -47,6 +50,19 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /jobs", s.submit)
 	mux.HandleFunc("GET /jobs/{id}", s.get)
 	mux.HandleFunc("GET /jobs/{id}/logs", s.logs)
+	var reg metrics.Registry
+	reg.Sampled("forge_queue_jobs", "Jobs in the queue, by state.", func() ([]metrics.Sample, error) {
+		counts, err := s.store.Counts(context.Background())
+		if err != nil {
+			return nil, err
+		}
+		var out []metrics.Sample
+		for _, state := range []string{"queued", "running", "done"} {
+			out = append(out, metrics.Sample{Labels: map[string]string{"state": state}, Value: counts[state]})
+		}
+		return out, nil
+	})
+	mux.Handle("GET /metrics", &reg)
 	return mux
 }
 

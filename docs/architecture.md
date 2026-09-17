@@ -1,7 +1,8 @@
 # Forge — architecture
 
-Status: **Phases 0–4 complete** — see [phase-0.md](phase-0.md) through
-[phase-4.md](phase-4.md) for what each means and how it is checked. The bounded worker pool, the sandbox's namespace
+Status: **all five phases complete** — see [phase-0.md](phase-0.md)
+through [phase-5.md](phase-5.md) for what each means and how it is
+checked, and [deployment.md](deployment.md) for running it. The bounded worker pool, the sandbox's namespace
 isolation with a private device filesystem, per-job cgroups v2 resource limits,
 a deny-by-default seccomp filter, the user namespace and, from Phase 1, a
 per-job overlay root filesystem exist. This document
@@ -86,6 +87,14 @@ comparing byte totals so that output the tail no longer holds is reported
 as missing rather than spliced, and a restart by another worker is
 announced. `forge-api` is the binary: `-dsn`, `-listen`; unprivileged, and
 nowhere near the sandbox.
+
+### internal/metrics — the Prometheus text format (Phase 5)
+
+Counters, a gauge, and sampled gauges, written out by hand; no client
+library. The API's `/metrics` samples the queue's depth by state on every
+scrape; the worker's `-metrics` listener reports claims, outcomes, lost
+leases and jobs in hand. A sample that fails — the database down — is
+absent with a comment, and the rest of the scrape is intact.
 
 ### internal/pool — bounded worker pool
 

@@ -3,7 +3,7 @@
 Forge is done when the first sentence of the README is true end to end: a
 job submitted over an API is scheduled onto a worker and runs inside the
 sandbox, and a worker that dies mid-job does not lose it or run it twice.
-Five phases; four are complete.
+Five phases; all five are complete.
 
 | Phase | Delivers | State |
 |---|---|---|
@@ -12,7 +12,7 @@ Five phases; four are complete.
 | 2 | **A worker that claims jobs from a durable queue** and runs them in the sandbox | done — [phase-2.md](phase-2.md) |
 | 3 | **An API** that submits jobs, reports their state and streams their logs | done — [phase-3.md](phase-3.md) |
 | 4 | **More than one worker**: leases that expire, fencing that makes a late worker's report harmless, a job that survives its worker | done — [phase-4.md](phase-4.md) |
-| 5 | **Operable**: metrics, a deployment document, and benchmark numbers from a harness | next |
+| 5 | **Operable**: metrics, a deployment document, and benchmark numbers from a harness | done — [phase-5.md](phase-5.md) |
 
 ## Phase 2 — worker and queue
 

@@ -26,7 +26,7 @@ VM_WORKER_BIN = $(HOME)/.cache/forge/worker.test
 FORGE_TEST_DSN ?=
 VM_DSN ?= postgres://forge:forge@127.0.0.1:5432/forge
 
-.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate mutate-queue
+.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate mutate-queue bench vm-bench verify-units
 
 all: test
 
@@ -117,3 +117,29 @@ mutate:
 ## mutate-queue: the same for the queue, on the host, against FORGE_TEST_DSN
 mutate-queue:
 	FORGE_TEST_DSN=$(FORGE_TEST_DSN) hack/mutate.py --queue
+
+## bench: sandbox setup latency and jobs per second (Linux, root, image, database)
+# The test binaries from test-sandbox, run for their benchmarks only. The
+# numbers in the README come from vm-bench on the machine it names.
+BENCH_ARGS = -test.run '^$$' -test.bench . -test.benchtime 20x -test.count=1
+bench: rootfs
+	$(GO) test -c -o /tmp/forge-sandbox.test ./internal/sandbox
+	$(GO) test -c -o /tmp/forge-worker.test ./internal/worker
+	sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test $(BENCH_ARGS)
+	sudo FORGE_TEST_ROOTFS=$(ROOTFS) FORGE_TEST_DSN=$(FORGE_TEST_DSN) /tmp/forge-worker.test $(BENCH_ARGS)
+
+## vm-bench: bench, from a macOS host, inside the colima VM
+vm-bench: $(VM_TEST_BIN) $(VM_WORKER_BIN)
+	$(VM) ssh -- sh -euc '\
+	  cp $(VM_TEST_BIN) /tmp/forge-sandbox.test; \
+	  cp $(VM_WORKER_BIN) /tmp/forge-worker.test; \
+	  uname -mr; nproc; \
+	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test $(BENCH_ARGS); \
+	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) FORGE_TEST_DSN=$(VM_DSN) /tmp/forge-worker.test $(BENCH_ARGS)'
+
+## verify-units: the systemd units in deploy/ parse, with the binaries where they say
+verify-units: build
+	$(GO) build -o /tmp/forge-api ./cmd/forge-api
+	$(GO) build -o /tmp/forge-worker ./cmd/forge-worker
+	sudo install -m 0755 /tmp/forge-api /tmp/forge-worker /usr/local/bin/
+	systemd-analyze verify deploy/forge-api.service deploy/forge-worker.service

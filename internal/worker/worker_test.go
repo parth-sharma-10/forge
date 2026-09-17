@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/parth-sharma-10/forge/internal/metrics"
 	"github.com/parth-sharma-10/forge/internal/queue"
 	"github.com/parth-sharma-10/forge/internal/sandbox"
 )
@@ -248,5 +250,39 @@ func TestLogKeepsTheTail(t *testing.T) {
 	l.Write([]byte("ab"))
 	if got := l.Log(); string(got.Tail) != "456789ab" || got.Total != 12 {
 		t.Fatalf("tail = %+v, want the last 8 bytes of 12: %q", got, "456789ab")
+	}
+}
+
+// TestMetricsCountTheWork: one job claimed and finished with a status, one
+// killed by a lost lease, and the counters say so.
+func TestMetricsCountTheWork(t *testing.T) {
+	store := newStore([]string{"exit"}, []string{"lost"})
+	store.lostAt = 2
+	var reg metrics.Registry
+	w := &Worker{Store: store, Lease: 60 * time.Millisecond, Poll: 10 * time.Millisecond, Metrics: &reg,
+		Run: func(ctx context.Context, spec sandbox.Spec) error {
+			if spec.Args[0] == "exit" {
+				return exitWith(3)
+			}
+			<-ctx.Done()
+			return ctx.Err()
+		}}
+	serve(t, w)
+	store.waitReport(t)
+	store.waitReport(t)
+
+	var b strings.Builder
+	reg.WriteTo(&b)
+	got := b.String()
+	for _, line := range []string{
+		"forge_jobs_claimed_total 2\n",
+		"forge_jobs_done_total{outcome=\"failed\"} 1\n",
+		"forge_jobs_done_total{outcome=\"killed\"} 1\n",
+		"forge_lease_lost_total 1\n",
+		"forge_jobs_running 0\n",
+	} {
+		if !strings.Contains(got, line) {
+			t.Errorf("metrics missing %q:\n%s", line, got)
+		}
 	}
 }
