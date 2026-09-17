@@ -18,6 +18,13 @@ VM ?= colima
 VM_GOARCH = $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
 VM_TEST_BIN = $(HOME)/.cache/forge/sandbox.test
 VM_CGROUP_BIN = $(HOME)/.cache/forge/cgroup.test
+VM_WORKER_BIN = $(HOME)/.cache/forge/worker.test
+
+# The queue tests and the worker's end-to-end test need a PostgreSQL to talk
+# to, named by FORGE_TEST_DSN; without it they skip on a developer's machine
+# and fail in CI. VM_DSN is the one inside the colima VM, for vm-test.
+FORGE_TEST_DSN ?=
+VM_DSN ?= postgres://forge:forge@127.0.0.1:5432/forge
 
 .PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate
 
@@ -41,7 +48,7 @@ build:
 
 clean:
 	$(GO) clean -testcache
-	rm -f $(VM_TEST_BIN) $(VM_CGROUP_BIN)
+	rm -f $(VM_TEST_BIN) $(VM_CGROUP_BIN) $(VM_WORKER_BIN)
 
 ## rootfs: unpack an Alpine root filesystem for the sandbox to run in
 # The files are then shifted into the sandbox's uid map, which the overlay
@@ -63,13 +70,15 @@ rootfs:
 test-sandbox: rootfs
 	$(GO) test -c -o /tmp/forge-sandbox.test ./internal/sandbox
 	$(GO) test -c -o /tmp/forge-cgroup.test ./internal/cgroup
+	$(GO) test -c -o /tmp/forge-worker.test ./internal/worker
 	sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1
 	sudo /tmp/forge-cgroup.test -test.v -test.count=1
+	sudo FORGE_TEST_ROOTFS=$(ROOTFS) FORGE_TEST_DSN=$(FORGE_TEST_DSN) CI=$(CI) /tmp/forge-worker.test -test.v -test.count=1 -test.run TestEndToEnd
 
 ## vm-test: run the sandbox tests inside the colima VM (macOS hosts)
 # colima mounts $HOME into the VM at the same path, so the cross-compiled test
 # binary needs no copying in and the VM needs no Go toolchain.
-vm-test: $(VM_TEST_BIN) $(VM_CGROUP_BIN)
+vm-test: $(VM_TEST_BIN) $(VM_CGROUP_BIN) $(VM_WORKER_BIN)
 	$(VM) ssh -- sh -euc '\
 	  if [ ! -x $(ROOTFS)/bin/sh ]; then \
 	    curl -fsSL $(ALPINE_URL) -o /tmp/rootfs.tgz; \
@@ -79,8 +88,10 @@ vm-test: $(VM_TEST_BIN) $(VM_CGROUP_BIN)
 	  sudo $(CURDIR)/hack/shift-rootfs.sh $(ROOTFS); \
 	  cp $(VM_TEST_BIN) /tmp/forge-sandbox.test; \
 	  cp $(VM_CGROUP_BIN) /tmp/forge-cgroup.test; \
+	  cp $(VM_WORKER_BIN) /tmp/forge-worker.test; \
 	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1; \
-	  sudo /tmp/forge-cgroup.test -test.v -test.count=1'
+	  sudo /tmp/forge-cgroup.test -test.v -test.count=1; \
+	  sudo FORGE_TEST_ROOTFS=$(ROOTFS) FORGE_TEST_DSN=$(VM_DSN) /tmp/forge-worker.test -test.v -test.count=1 -test.run TestEndToEnd'
 
 $(VM_TEST_BIN): $(wildcard internal/sandbox/*.go) $(wildcard internal/cgroup/*.go)
 	@mkdir -p $(dir $@)
@@ -89,6 +100,10 @@ $(VM_TEST_BIN): $(wildcard internal/sandbox/*.go) $(wildcard internal/cgroup/*.g
 $(VM_CGROUP_BIN): $(wildcard internal/cgroup/*.go)
 	@mkdir -p $(dir $@)
 	GOOS=linux GOARCH=$(VM_GOARCH) $(GO) test -c -o $@ ./internal/cgroup
+
+$(VM_WORKER_BIN): $(wildcard internal/*/*.go)
+	@mkdir -p $(dir $@)
+	GOOS=linux GOARCH=$(VM_GOARCH) $(GO) test -c -o $@ ./internal/worker
 
 vm-shell:
 	$(VM) ssh
