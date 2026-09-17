@@ -1,8 +1,7 @@
 # Forge — architecture
 
-Status: **Phases 0–3 complete** — see [phase-0.md](phase-0.md),
-[phase-1.md](phase-1.md), [phase-2.md](phase-2.md) and
-[phase-3.md](phase-3.md) for what each means and how it is checked. The bounded worker pool, the sandbox's namespace
+Status: **Phases 0–4 complete** — see [phase-0.md](phase-0.md) through
+[phase-4.md](phase-4.md) for what each means and how it is checked. The bounded worker pool, the sandbox's namespace
 isolation with a private device filesystem, per-job cgroups v2 resource limits,
 a deny-by-default seccomp filter, the user namespace and, from Phase 1, a
 per-job overlay root filesystem exist. This document
@@ -64,8 +63,18 @@ is tested against an in-memory store; the end-to-end test runs a submitted
 job through the real queue and the real sandbox and reads its exit status
 and log back.
 
-`forge-worker` is the binary: `-dsn`, `-rootfs`, `-workers`, `-lease`, the
-sandbox's limit flags, and the same two signals as before.
+`forge-worker` is the binary: `-dsn`, `-rootfs`, `-workers`, `-lease`,
+`-max-attempts`, the sandbox's limit flags, and the same two signals as
+before.
+
+**More than one worker** (Phase 4) is what the lease and the token were
+for, and the tests are where they are proven: a worker process `SIGKILL`ed
+mid-job leaves a job whose lease expires and which another worker reclaims,
+runs again and reports (attempt 2 on the row); a worker that lost its lease
+and finished late reports while the new holder is still running, and only
+the token refuses it; ten claimers hammering a live lease get nothing; a job
+claimed more than `MaxAttempts` times is reported as given up rather than
+run. Delivery is at-least-once, and the row says how many times.
 
 ### internal/api — the HTTP front door (Phase 3)
 

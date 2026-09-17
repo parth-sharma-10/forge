@@ -5,7 +5,7 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phases 0–3 of 5 complete** ([docs/phase-0.md](docs/phase-0.md), [docs/phase-1.md](docs/phase-1.md), [docs/phase-2.md](docs/phase-2.md), [docs/phase-3.md](docs/phase-3.md)). What exists today is the sandbox —
+**Status: Phases 0–4 of 5 complete** ([docs/phase-0.md](docs/phase-0.md) through [docs/phase-4.md](docs/phase-4.md)). What exists today is the sandbox —
 namespace isolation and a private device filesystem, per-job cgroups v2
 resource limits, a deny-by-default seccomp filter that also bounds `clone`'s
 flags, a user namespace that makes sandbox root an unprivileged uid on the
@@ -13,8 +13,9 @@ host, a per-job overlay so each build gets its own writable root filesystem,
 a capability bounding set cut to what a build needs — a worker that claims
 jobs from a PostgreSQL queue with leases and fencing tokens and runs them in
 it, and an HTTP API that submits jobs, reports them and streams their logs.
-More than one worker against the same queue is written for but not yet
-tested by killing one; that is Phase 4. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
+More than one worker against the same queue is tested by killing one
+mid-job. What is left is Phase 5: metrics, a deployment document, and
+benchmark numbers. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
 implemented, [docs/decisions.md](docs/decisions.md) for why, and
 [docs/roadmap.md](docs/roadmap.md) for what "done" means.
 
@@ -25,6 +26,7 @@ make test          # gofmt check, go vet, go test -race — everywhere
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
 make mutate        # break the sandbox 27 ways and check a test notices each
+make mutate-queue  # break the queue 4 ways, on the host, against FORGE_TEST_DSN
 ```
 
 The queue's tests run against a real PostgreSQL named by `FORGE_TEST_DSN`
@@ -200,6 +202,15 @@ the result, because the token has moved on to whoever reclaimed it. The
 worker side of that is the heartbeat: the moment it comes back "lease lost",
 the build is killed, since nothing it produces can be reported.
 
+A worker that dies mid-job — `SIGKILL`, a lost machine — leaves a job
+whose lease expires within `-lease` and which any other worker then
+reclaims and runs again; the row's `attempt` says how many times that
+happened. A worker that merely stopped heartbeating and finishes late finds
+its report refused: the fencing token moved on with the reclaim. A job
+claimed more than `-max-attempts` times (three by default) is reported as
+given up rather than run again, so a job that kills every worker it lands
+on stops landing.
+
 `Ctrl-C` once drains — the jobs in hand finish, no more are claimed. Twice
 kills the jobs in hand.
 
@@ -281,9 +292,9 @@ is not among the nine. The kept list is decided by what the tests show a
 package manager doing, not by what a build might someday want.
 
 Delivery is at-least-once. A worker that dies after the build and before
-the report leaves a job whose lease expires and is run again; nothing
-records that it happened twice. Phase 4 is where more than one worker is
-tested, and where that gets measured.
+the report leaves a job whose lease expires and is run again; the row's
+attempt count says it happened, and nothing makes the second run unnecessary
+— idempotent jobs are the caller's business.
 
 The API has no authentication, no way to cancel or list jobs, and no
 webhook — a webhook is a client of `POST /jobs` and can live anywhere.

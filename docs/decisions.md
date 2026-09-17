@@ -590,6 +590,40 @@ waits for every connection to come back. A schema failure of any kind —
 missing grants, say — would have been a daemon that never started and
 never said why. The transaction is now released before the pool is closed.
 
+## 2026-09-17 — A dead worker's job runs again; a late worker's report does not land
+
+Phase 4 is the queue's design tested rather than described, and the tests
+are the decision record.
+
+**The worker that dies is a real process.** A goroutine cannot be killed,
+so `TestAJobSurvivesItsWorker` starts the test binary in a fourth identity
+— a worker with a fake runner — waits for it to claim, and `SIGKILL`s it.
+The job's lease expires, a second worker reclaims it, and the row says
+attempt 2. That is the whole of the at-least-once contract, measured: the
+attempt count and the last worker are on the row and in the API.
+
+**The fencing token, discriminated from the state check.** A worker that
+stopped heartbeating and lost its lease, then finished its build, reports
+while the worker that took the job over is *still running it*. The row is
+`running`, which is what the stale report matches on; only the token
+refuses it. `TestALateWorkersReportIsRefused` was first written with the
+second worker already done, and would have passed on the state check
+alone — the mutation `report-without-fence` was what showed it, and the
+test now holds the second worker mid-build while the first reports.
+
+**The attempt cap is the worker's, not the query's.** A job past
+`MaxAttempts` is claimed like any other and reported as given up without
+running. Excluding it in `Claim`'s `WHERE` would leave it `running` with an
+expired lease — a row nothing touches again and no state name for what it
+is. Three attempts by default; `-max-attempts` on the worker.
+
+**The queue mutations run on the host.** `hack/mutate.py --queue` builds
+the queue's tests, runs them against `FORGE_TEST_DSN`, then the worker's;
+four mutants — both fence checks, the reclaim clause, the schema lock —
+all caught. The harness's first VM mutant that hung a whole test run
+(2026-09-11) has a cousin here: a fake runner that ignores its context
+turned a failed assertion into a hung `Serve`. Fakes honour `ctx` now.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that
