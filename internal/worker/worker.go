@@ -187,7 +187,6 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 	}
 
 	w.running.Inc()
-	defer w.running.Dec()
 	buildCtx, cancelBuild := context.WithCancel(ctx)
 	defer cancelBuild()
 
@@ -224,6 +223,10 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 	})
 	cancelBuild()
 	<-heartbeatDone
+	// The build has exited: it is no longer in hand, whatever the report
+	// is about to say. Decremented here rather than deferred so a reader
+	// that sees the report sees the gauge already down.
+	w.running.Dec()
 
 	r := result(err)
 	r.Log = log.Log()
