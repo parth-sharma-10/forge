@@ -99,8 +99,8 @@ func TestEndToEnd(t *testing.T) {
 	if s.Result.ExitCode != 3 || s.Result.OOMKilled || s.Result.Error != "" {
 		t.Errorf("plain job result: %+v, want exit 3", s.Result)
 	}
-	if got := string(s.Result.Log); got != "hello\nwarn\nforge\n" {
-		t.Errorf("plain job log = %q: the sandbox's output did not reach the queue", got)
+	if got := string(s.Result.Log.Tail); got != "hello\nwarn\nforge\n" || s.Result.Log.Total != int64(len(got)) {
+		t.Errorf("plain job log = %+v: the sandbox's output did not reach the queue", s.Result.Log)
 	}
 
 	// The shell itself is what the kernel kills, so there is no exit status

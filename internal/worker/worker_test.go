@@ -21,6 +21,7 @@ type fakeStore struct {
 	jobs     []queue.Job
 	lostAt   int // heartbeats before the lease is reported lost; 0 = never
 	beats    int
+	flushed  []queue.Log // the log carried by each heartbeat
 	reports  []queue.Result
 	reported chan struct{}
 }
@@ -44,10 +45,11 @@ func (s *fakeStore) Claim(context.Context, string, time.Duration) (queue.Job, er
 	return j, nil
 }
 
-func (s *fakeStore) Heartbeat(context.Context, queue.Job, time.Duration) error {
+func (s *fakeStore) Heartbeat(_ context.Context, _ queue.Job, _ time.Duration, log queue.Log) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.beats++
+	s.flushed = append(s.flushed, log)
 	if s.lostAt != 0 && s.beats >= s.lostAt {
 		return queue.ErrLeaseLost
 	}
@@ -112,8 +114,29 @@ func TestAJobIsRunAndReported(t *testing.T) {
 	if got.Rootfs != "/img" || len(got.Args) != 3 || got.Args[2] != "exit 7" {
 		t.Fatalf("the sandbox was given %+v", got)
 	}
-	if r.ExitCode != 7 || r.OOMKilled || r.Error != "" || string(r.Log) != "built\nwarn\n" {
+	if r.ExitCode != 7 || r.OOMKilled || r.Error != "" || string(r.Log.Tail) != "built\nwarn\n" || r.Log.Total != 11 {
 		t.Fatalf("reported %+v", r)
+	}
+}
+
+// TestTheWorkerFlushesTheLogWhileRunning: a heartbeat that goes out while
+// the build is still writing carries what has been written so far.
+func TestTheWorkerFlushesTheLogWhileRunning(t *testing.T) {
+	store := newStore([]string{"slow"})
+	w := &Worker{Store: store, Lease: 90 * time.Millisecond, Poll: 10 * time.Millisecond,
+		Run: func(ctx context.Context, spec sandbox.Spec) error {
+			spec.Stdout.Write([]byte("step 1\n"))
+			time.Sleep(70 * time.Millisecond)
+			spec.Stdout.Write([]byte("step 2\n"))
+			return nil
+		}}
+	serve(t, w)
+	store.waitReport(t)
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if len(store.flushed) == 0 || string(store.flushed[0].Tail) != "step 1\n" || store.flushed[0].Total != 7 {
+		t.Fatalf("heartbeats carried %+v, want the first to carry \"step 1\\n\"", store.flushed)
 	}
 }
 
@@ -223,7 +246,7 @@ func TestLogKeepsTheTail(t *testing.T) {
 	l := &tail{limit: 8}
 	l.Write([]byte("0123456789"))
 	l.Write([]byte("ab"))
-	if got := string(l.Bytes()); got != "456789ab" {
-		t.Fatalf("tail = %q, want the last 8 bytes: %q", got, "456789ab")
+	if got := l.Log(); string(got.Tail) != "456789ab" || got.Total != 12 {
+		t.Fatalf("tail = %+v, want the last 8 bytes of 12: %q", got, "456789ab")
 	}
 }

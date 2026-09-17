@@ -1,8 +1,8 @@
 # Forge — architecture
 
-Status: **Phases 0, 1 and 2 complete** — see [phase-0.md](phase-0.md),
-[phase-1.md](phase-1.md) and [phase-2.md](phase-2.md) for what each means
-and how it is checked. The bounded worker pool, the sandbox's namespace
+Status: **Phases 0–3 complete** — see [phase-0.md](phase-0.md),
+[phase-1.md](phase-1.md), [phase-2.md](phase-2.md) and
+[phase-3.md](phase-3.md) for what each means and how it is checked. The bounded worker pool, the sandbox's namespace
 isolation with a private device filesystem, per-job cgroups v2 resource limits,
 a deny-by-default seccomp filter, the user namespace and, from Phase 1, a
 per-job overlay root filesystem exist. This document
@@ -66,6 +66,17 @@ and log back.
 
 `forge-worker` is the binary: `-dsn`, `-rootfs`, `-workers`, `-lease`, the
 sandbox's limit flags, and the same two signals as before.
+
+### internal/api — the HTTP front door (Phase 3)
+
+`POST /jobs` submits; `GET /jobs/{id}` reads state; `GET /jobs/{id}/logs`
+streams. Standard library `net/http`. The worker flushes its log tail with
+every heartbeat, so a followed log is at most one heartbeat behind; the
+follower re-reads the row every half second and writes what is new,
+comparing byte totals so that output the tail no longer holds is reported
+as missing rather than spliced, and a restart by another worker is
+announced. `forge-api` is the binary: `-dsn`, `-listen`; unprivileged, and
+nowhere near the sandbox.
 
 ### internal/pool — bounded worker pool
 

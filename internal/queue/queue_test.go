@@ -60,14 +60,14 @@ func TestSubmitClaimReport(t *testing.T) {
 		t.Fatalf("after claim: %+v, want running by w1, attempt 1", s)
 	}
 
-	if err := q.Report(ctx, job, Result{ExitCode: 3, Log: []byte("built\n")}); err != nil {
+	if err := q.Report(ctx, job, Result{ExitCode: 3, Log: Log{Tail: []byte("built\n"), Total: 6}}); err != nil {
 		t.Fatal(err)
 	}
 	s, err := q.Get(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if s.State != "done" || s.Result.ExitCode != 3 || string(s.Result.Log) != "built\n" || s.Result.OOMKilled {
+	if s.State != "done" || s.Result.ExitCode != 3 || string(s.Result.Log.Tail) != "built\n" || s.Result.Log.Total != 6 || s.Result.OOMKilled {
 		t.Fatalf("after report: %+v", s)
 	}
 	if _, err := q.Claim(ctx, "w1", time.Minute); !errors.Is(err, ErrEmpty) {
@@ -171,7 +171,7 @@ func TestAStaleFenceCannotReportOrHeartbeat(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := q.Heartbeat(ctx, stale, time.Minute); !errors.Is(err, ErrLeaseLost) {
+	if err := q.Heartbeat(ctx, stale, time.Minute, Log{}); !errors.Is(err, ErrLeaseLost) {
 		t.Fatalf("heartbeat with a stale fence: %v, want ErrLeaseLost", err)
 	}
 	if err := q.Report(ctx, stale, Result{ExitCode: 0}); !errors.Is(err, ErrLeaseLost) {
@@ -181,7 +181,7 @@ func TestAStaleFenceCannotReportOrHeartbeat(t *testing.T) {
 		t.Fatalf("the stale report changed the row: %+v", s)
 	}
 
-	if err := q.Heartbeat(ctx, live, time.Minute); err != nil {
+	if err := q.Heartbeat(ctx, live, time.Minute, Log{}); err != nil {
 		t.Fatalf("heartbeat with the live fence: %v", err)
 	}
 	if err := q.Report(ctx, live, Result{ExitCode: 0}); err != nil {
@@ -198,12 +198,61 @@ func TestHeartbeatExtendsTheLease(t *testing.T) {
 	job, _ := q.Claim(ctx, "w1", 100*time.Millisecond)
 	for i := 0; i < 3; i++ {
 		time.Sleep(60 * time.Millisecond)
-		if err := q.Heartbeat(ctx, job, 100*time.Millisecond); err != nil {
+		if err := q.Heartbeat(ctx, job, 100*time.Millisecond, Log{}); err != nil {
 			t.Fatalf("heartbeat %d: %v", i, err)
 		}
 	}
 	// 180ms in, well past the original 100ms lease.
 	if _, err := q.Claim(ctx, "w2", time.Minute); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("claim while the heartbeats kept the lease: %v, want ErrEmpty", err)
+	}
+}
+
+// TestHeartbeatCarriesTheLog: what the worker has so far is readable while
+// the job runs, and the count beside it says how much of the beginning is
+// missing from the tail.
+func TestHeartbeatCarriesTheLog(t *testing.T) {
+	q, ctx := open(t), context.Background()
+	id, _ := q.Submit(ctx, []string{"true"})
+	job, _ := q.Claim(ctx, "w1", time.Minute)
+	if err := q.Heartbeat(ctx, job, time.Minute, Log{Tail: []byte("cdef"), Total: 6}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := q.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.State != "running" || string(s.Result.Log.Tail) != "cdef" || s.Result.Log.Total != 6 {
+		t.Fatalf("while running: %+v, want the flushed tail and total", s)
+	}
+}
+
+// TestConcurrentOpensOnAFreshDatabase is the schema race: the API and the
+// worker start together on every deployment, and CREATE TABLE IF NOT EXISTS
+// is not safe against itself. Without the advisory lock one of these fails
+// on the catalogue's unique index.
+func TestConcurrentOpensOnAFreshDatabase(t *testing.T) {
+	q, ctx := open(t), context.Background()
+	if _, err := q.db.Exec(ctx, `DROP TABLE jobs`); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			q, err := Open(ctx, os.Getenv(dsnEnv))
+			if err != nil {
+				errs <- err
+				return
+			}
+			q.Close()
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("concurrent Open: %v", err)
 	}
 }
