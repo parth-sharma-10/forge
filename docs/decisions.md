@@ -456,6 +456,52 @@ equivalent; per the 2026-09-15 rule it is retired rather than carried as an
 expected miss. The tmpfs stays: it still keeps the nodes out of the job's
 root filesystem, bounded to 64k and `noexec`.
 
+## 2026-09-16 — clone is refused with EPERM when it asks for a namespace
+
+The filter's one argument check. `clone` must be allowed for a build to fork
+at all, and its first argument decides whether the call is a fork, a thread
+or a request for new namespaces; the filter loads the low word of it and
+refuses the call if any `CLONE_NEW*` bit is set.
+
+`EPERM`, not the `ENOSYS` every other denial returns. `ENOSYS` is a signal to
+a C library that the syscall is missing and an older one should be tried;
+`clone` is not missing, and there is no older way to create a namespace. The
+kernel's own answer to a process that lacks the privilege is `EPERM`, and a
+tool that reports it — `unshare: Operation not permitted` — says the true
+thing. `clone3` stays denied by number: its flags are in a struct the filter
+cannot read, and its documented fallback is `clone`.
+
+Rejected: killing the process instead. A build tool that probes for
+namespace support and takes the refusal gracefully is an ordinary thing to
+write, and killing it would turn a supported build into a mystery.
+
+## 2026-09-16 — The bounding set is nine capabilities, decided by the tests
+
+After `execve` a build holds chown, dac_override, fowner, fsetid, kill,
+setgid, setuid, net_bind_service and setfcap, and nothing else. Everything
+above that — `CAP_SYS_ADMIN` first among them — is dropped from the bounding
+set before the exec, and `CAP_SETPCAP` last, so the set cannot be widened
+again from inside.
+
+The list was chosen by what the existing tests show a build doing: chown to
+another uid, chmod, unlink and replace files the image owns, run `apk`. Not
+by Docker's default set, which also keeps mknod, sys_chroot, net_raw,
+audit_write and setpcap — mknod and chroot the filter denies anyway, and the
+other three no build has needed. A capability is added to the list when a
+test shows a build needing it, and the test that shows it is the one that
+keeps it.
+
+The first behavioural test was wrong, and the mutation harness said so:
+`nice -n -5` fails without `CAP_SYS_NICE` — but it failed with the bounding
+set intact too, because `can_nice` checks against the initial user
+namespace, where this root never had the capability. The mutation
+`bounding-set-not-dropped` was caught by the `/proc/self/status` test alone.
+A raw socket replaced it: `CAP_NET_RAW` is checked against the namespace
+that owns the network namespace, which the sandbox's own user namespace
+does. Most capability checks in the kernel are `capable()`, against the
+initial namespace, and a test of a dropped capability has to find one of the
+`ns_capable()` minority to prove anything.
+
 ## Pending decisions
 
 These are called out in the brief and will be written up when the code that

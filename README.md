@@ -5,13 +5,15 @@ scheduled onto a worker, and run the untrusted build command inside a Linux
 sandbox that Forge builds itself from namespaces, cgroups v2, `pivot_root`,
 capabilities and seccomp — not Docker, not runc, not a container library.
 
-**Status: Phase 0 of 5 complete** ([docs/phase-0.md](docs/phase-0.md)), Phase 1 in progress. What exists today is the bounded worker
+**Status: Phases 0 and 1 of 5 complete** ([docs/phase-0.md](docs/phase-0.md), [docs/phase-1.md](docs/phase-1.md)). What exists today is the bounded worker
 pool, the sandbox's namespace isolation and private device filesystem, per-job
-cgroups v2 resource limits, a deny-by-default seccomp filter, a user
-namespace that makes sandbox root an unprivileged uid on the host, and a
-per-job overlay so each build gets its own writable root filesystem. The API,
+cgroups v2 resource limits, a deny-by-default seccomp filter that also bounds
+`clone`'s flags, a user namespace that makes sandbox root an unprivileged uid
+on the host, a per-job overlay so each build gets its own writable root
+filesystem, and a capability bounding set cut to what a build needs. The API,
 the queue and everything distributed are not built yet. This README will not claim otherwise; see [docs/architecture.md](docs/architecture.md) for what is
-implemented and [docs/decisions.md](docs/decisions.md) for why.
+implemented, [docs/decisions.md](docs/decisions.md) for why, and
+[docs/roadmap.md](docs/roadmap.md) for what "done" means.
 
 ## Quickstart
 
@@ -19,7 +21,7 @@ implemented and [docs/decisions.md](docs/decisions.md) for why.
 make test          # gofmt check, go vet, go test -race — everywhere
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
-make mutate        # break the sandbox 23 ways and check a test notices each
+make mutate        # break the sandbox 27 ways and check a test notices each
 ```
 
 ### The sandbox (Linux, as root)
@@ -217,12 +219,14 @@ of RAM. A job with no memory limit can fill that much before writes fail with
 Nothing a build writes survives the job. Artifacts come out on stdout or not
 at all until a later phase gives the worker a way to collect them.
 
-The seccomp filter is an allowlist of syscall *numbers*; it never looks at
-arguments. `clone` has to be allowed for a build to fork at all, so its flags
-are unbounded and a build can still create namespaces of its own. An unlisted
-syscall returns `ENOSYS`, which is what lets a C library fall back to an older
-call rather than fail outright — and which makes a denial read like an old
-kernel in a build log rather than like a denial.
+The seccomp filter is an allowlist of syscall *numbers*, with one exception:
+`clone` is also checked for `CLONE_NEW*` flags, and refused with `EPERM` when
+it carries any, so a build can fork and thread but not create namespaces of
+its own. `clone3` is denied by number, since its flags are in a struct the
+filter cannot read; glibc falls back to `clone`. An unlisted syscall returns
+`ENOSYS`, which is what lets a C library fall back to an older call rather
+than fail outright — and which makes a denial read like an old kernel in a
+build log rather than like a denial.
 
 The `/dev` the sandbox provides is six nodes and four symlinks, and nothing
 else. A build that wants a pty or POSIX shared memory (`/dev/ptmx`,
@@ -230,10 +234,12 @@ else. A build that wants a pty or POSIX shared memory (`/dev/ptmx`,
 the filter answers `mknod` with `ENOSYS`, and the user namespace would refuse
 it anyway.
 
-A build still holds a full capability set *inside* its namespaces. What that
-buys it is bounded by the map — the capabilities do not reach a uid the
-namespace cannot name — and by the filter, which denies the syscalls that would
-use them. Dropping the bounding set as well is worth doing and is not done.
+A build holds nine capabilities after `execve` — chown, dac_override, fowner,
+fsetid, kill, setgid, setuid, net_bind_service, setfcap — and no others, in
+any set. `CAP_SYS_ADMIN` is gone before the build starts. The bounding set is
+what enforces it, and the set only shrinks; `CAP_SETPCAP`, which shrinks it,
+is not among the nine. The kept list is decided by what the tests show a
+package manager doing, not by what a build might someday want.
 
 There is also still no API, no persistence, and no benchmark numbers — and none
 will be quoted here until a harness produces them.

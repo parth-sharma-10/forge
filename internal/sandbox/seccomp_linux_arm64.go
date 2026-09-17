@@ -8,6 +8,9 @@ import "syscall"
 // little-endian bits. See the amd64 file for what the comparison is for.
 const auditArch = 0xc00000b7
 
+// sysClone3 is clone3(2). See the amd64 file.
+const sysClone3 = 435
+
 // sysSeccomp is seccomp(2), which Go's arm64 table does define.
 const sysSeccomp = syscall.SYS_SECCOMP
 

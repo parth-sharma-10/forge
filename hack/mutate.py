@@ -211,6 +211,36 @@ MUTATIONS = [
     # Not scored: dropping ",userxattr". On Ubuntu's 6.8 the mount sets its
     # trusted.* xattrs from inside the user namespace without complaint, so no
     # test can see the option; docs/decisions.md 2026-09-16 has the account.
+    # --- clone flags (Phase 1) ---
+    # The flag test compares against nothing, so it never jumps to the
+    # refusal: clone is back to being allowed by number alone.
+    (
+        "clone-flags-unchecked",
+        SECCOMP,
+        "syscall.SockFilter{Code: bpfJumpSet, Jt: 1, K: cloneNamespaceFlags},",
+        "syscall.SockFilter{Code: bpfJumpSet, Jt: 1, K: 0},",
+    ),
+    # One namespace missing from the mask — the one that matters most.
+    (
+        "clone-newuser-not-in-mask",
+        SECCOMP,
+        "\t\tsyscall.CLONE_NEWUSER | syscall.CLONE_NEWPID |",
+        "\t\tsyscall.CLONE_NEWPID |",
+    ),
+    # --- capability bounding set (Phase 1) ---
+    (
+        "bounding-set-not-dropped",
+        SANDBOX,
+        "\tif err := dropBoundingSet(); err != nil {\n\t\treturn err\n\t}\n",
+        "",
+    ),
+    # Everything dropped but the one capability the exercise is for.
+    (
+        "sys-admin-kept",
+        SANDBOX,
+        "\t10, // CAP_NET_BIND_SERVICE\n",
+        "\t10, // CAP_NET_BIND_SERVICE\n\t21,\n",
+    ),
 ]
 
 

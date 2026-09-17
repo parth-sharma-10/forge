@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -23,7 +24,74 @@ import (
 // so it must take the child path instead of running the suite again.
 func TestMain(m *testing.M) {
 	MaybeChild()
+	if len(os.Args) > 2 && os.Args[1] == probeArg {
+		probe(os.Args[2])
+	}
 	os.Exit(m.Run())
+}
+
+// probeArg marks the test binary's third identity: the build command itself,
+// copied into a scratch image and run inside a sandbox, for the properties
+// that need a raw syscall no shell utility issues.
+const probeArg = "forge-test-probe"
+
+// probe issues one raw syscall and prints what the kernel said.
+func probe(what string) {
+	var flags uintptr
+	switch what {
+	case "clone-fork":
+		flags = uintptr(syscall.SIGCHLD)
+	case "clone-newuser":
+		flags = syscall.CLONE_NEWUSER | uintptr(syscall.SIGCHLD)
+	case "raw-socket":
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_ICMP)
+		if err != nil {
+			fmt.Println("socket:", err)
+		} else {
+			syscall.Close(fd)
+			fmt.Println("socket: ok")
+		}
+		os.Exit(0)
+	default:
+		fmt.Println("probe: unknown", what)
+		os.Exit(2)
+	}
+	// RawSyscall, and nothing but a raw exit in the child: the child is a
+	// single-threaded copy of a Go process and must not touch the runtime.
+	pid, _, errno := syscall.RawSyscall(syscall.SYS_CLONE, flags, 0, 0)
+	if errno != 0 {
+		fmt.Println("clone:", errno)
+		os.Exit(0)
+	}
+	if pid == 0 {
+		syscall.RawSyscall(syscall.SYS_EXIT_GROUP, 0, 0, 0)
+	}
+	var status syscall.WaitStatus
+	if _, err := syscall.Wait4(int(pid), &status, 0, nil); err != nil {
+		fmt.Println("wait4:", err)
+		os.Exit(0)
+	}
+	fmt.Println("clone: ok")
+	os.Exit(0)
+}
+
+// runProbe copies the test binary into a private image and runs it there as
+// the build, in probe mode.
+func runProbe(t *testing.T, what string) string {
+	t.Helper()
+	dir := scratchImage(t)
+	self, err := os.ReadFile("/proc/self/exe")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "forge-probe"), self, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, err := runSpec(t, Spec{Rootfs: dir, Args: []string{"/forge-probe", probeArg, what}})
+	if err != nil {
+		t.Fatalf("probe %s: %v (output %q)", what, err, out)
+	}
+	return out
 }
 
 const rootfsEnv = "FORGE_TEST_ROOTFS"
@@ -815,5 +883,67 @@ func TestTheLayerCountsAgainstTheMemoryLimit(t *testing.T) {
 	}
 	if strings.Contains(out, "survived") {
 		t.Fatalf("64MiB were written into the layer under a 16MiB limit: %q", out)
+	}
+}
+
+// TestABuildCannotCreateANamespace is the installed half of bounding clone:
+// the policy test in seccomp_linux_test.go runs the filter in Go, this runs
+// it in the kernel. The fork first, so that a refusal of the namespace is
+// known to be the flags and not the probe.
+func TestABuildCannotCreateANamespace(t *testing.T) {
+	if out := runProbe(t, "clone-fork"); out != "clone: ok" {
+		t.Fatalf("a plain fork inside the sandbox: %q, want it to work", out)
+	}
+	if out := runProbe(t, "clone-newuser"); out != "clone: operation not permitted" {
+		t.Fatalf("clone(CLONE_NEWUSER) inside the sandbox: %q, want EPERM", out)
+	}
+}
+
+// TestTheBoundingSetIsTheKeepList reads the sets the kernel reports for the
+// build after execve. The mask is written out rather than computed from
+// keptCapabilities, so that a capability added to the keep list is a
+// failing test and not a passing one. CAP_SYS_ADMIN is also checked by name,
+// because it is the one the whole exercise is for.
+func TestTheBoundingSetIsTheKeepList(t *testing.T) {
+	// CHOWN, DAC_OVERRIDE, FOWNER, FSETID, KILL, SETGID, SETUID,
+	// NET_BIND_SERVICE, SETFCAP.
+	const want = "00000000800004fb"
+	const sysAdmin = 1 << 21
+	out, err := sh(t, "grep -E '^Cap(Inh|Prm|Eff|Bnd|Amb):' /proc/self/status")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	sets := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if k, v, ok := strings.Cut(line, ":"); ok {
+			sets[k] = strings.TrimSpace(v)
+		}
+	}
+	for _, set := range []string{"CapPrm", "CapEff", "CapBnd"} {
+		if sets[set] != want {
+			t.Errorf("%s = %s, want %s", set, sets[set], want)
+		}
+		if v, _ := strconv.ParseUint(sets[set], 16, 64); v&sysAdmin != 0 {
+			t.Errorf("%s holds CAP_SYS_ADMIN", set)
+		}
+	}
+	for _, set := range []string{"CapInh", "CapAmb"} {
+		if sets[set] != "0000000000000000" {
+			t.Errorf("%s = %s, want empty: the exec would confer it", set, sets[set])
+		}
+	}
+}
+
+// TestADroppedCapabilityIsGone is the behavioural half. A raw socket needs
+// CAP_NET_RAW in the user namespace that owns the network namespace, which
+// is this sandbox's own — so root here would ordinarily have it, and the
+// bounding set is the only reason it does not. Chosen over the obvious
+// probes because the kernel checks most of those against the initial
+// namespace, where this root never had anything to lose. The chown in
+// TestSandboxRootIsAnUnprivilegedHostUid is the other direction — a kept
+// capability still works.
+func TestADroppedCapabilityIsGone(t *testing.T) {
+	if out := runProbe(t, "raw-socket"); out != "socket: operation not permitted" {
+		t.Fatalf("socket(AF_INET, SOCK_RAW) inside the sandbox: %q, want EPERM: the build still holds CAP_NET_RAW", out)
 	}
 }

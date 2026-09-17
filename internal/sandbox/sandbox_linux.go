@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/parth-sharma-10/forge/internal/cgroup"
@@ -286,6 +288,65 @@ func mkdev(major, minor uint32) int {
 	return int((minor & 0xff) | (major << 8) | ((minor &^ 0xff) << 12))
 }
 
+// keptCapabilities is what a build holds after execve, as root of its own
+// user namespace: enough to own, chown and chmod files, signal its processes
+// and run a package manager — and nothing that reaches the kernel's own
+// configuration. The numbers are from linux/capability.h.
+//
+// The bounding set is where this is enforced, because of what execve does
+// for a root process: it confers the bounding set, wholesale, as the new
+// permitted and effective sets. Dropping a capability from the bounding set
+// before the exec is therefore the same as the build never having had it,
+// and nothing the build does afterwards can put it back — the set only
+// shrinks, and CAP_SETPCAP, which shrinks it, is not kept either.
+var keptCapabilities = []uintptr{
+	0,  // CAP_CHOWN
+	1,  // CAP_DAC_OVERRIDE
+	3,  // CAP_FOWNER
+	4,  // CAP_FSETID
+	5,  // CAP_KILL
+	6,  // CAP_SETGID
+	7,  // CAP_SETUID
+	10, // CAP_NET_BIND_SERVICE
+	31, // CAP_SETFCAP: a package that carries file capabilities installs them
+}
+
+const (
+	prCapBSetDrop = 24 // PR_CAPBSET_DROP
+	capSetPCap    = 8  // CAP_SETPCAP, the capability PR_CAPBSET_DROP itself needs
+)
+
+// dropBoundingSet removes every capability but keptCapabilities from the
+// bounding set. CAP_SETPCAP goes last, since each drop needs it. The highest
+// capability is the running kernel's to say — a number written here would
+// be EINVAL on an older kernel and a hole on a newer one.
+func dropBoundingSet() error {
+	last, err := os.ReadFile("/proc/sys/kernel/cap_last_cap")
+	if err != nil {
+		return fmt.Errorf("sandbox: %w", err)
+	}
+	capLast, err := strconv.ParseUint(strings.TrimSpace(string(last)), 10, 8)
+	if err != nil {
+		return fmt.Errorf("sandbox: cap_last_cap: %w", err)
+	}
+	kept := make(map[uintptr]bool, len(keptCapabilities))
+	for _, c := range keptCapabilities {
+		kept[c] = true
+	}
+	for c := uintptr(0); c <= uintptr(capLast); c++ {
+		if kept[c] || c == capSetPCap {
+			continue
+		}
+		if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prCapBSetDrop, c, 0); errno != 0 {
+			return fmt.Errorf("sandbox: drop capability %d from the bounding set: %w", c, errno)
+		}
+	}
+	if _, _, errno := syscall.RawSyscall(syscall.SYS_PRCTL, prCapBSetDrop, capSetPCap, 0); errno != 0 {
+		return fmt.Errorf("sandbox: drop CAP_SETPCAP from the bounding set: %w", errno)
+	}
+	return nil
+}
+
 // MaybeChild applies the sandbox to this process and execs the build command
 // over it, if this process is the re-executed child. Otherwise it returns
 // immediately. It must be called before flag parsing, since the child's argv
@@ -311,7 +372,9 @@ func MaybeChild() {
 //     mountProc and mountDev for the two different reasons;
 //  4. pivot_root, then detach the old root, so no path to the host remains
 //     (chroot alone would leave one — an open directory fd escapes it);
-//  5. install the seccomp filter last of all, since every step above uses
+//  5. drop the capability bounding set, once nothing above still needs a
+//     capability, so the exec in step 6 confers only what a build keeps;
+//  6. install the seccomp filter last of all, since every step above uses
 //     syscalls it denies — and after the command has been resolved, because
 //     that walks PATH and the filter has no reason to be in force for it.
 func child() error {
@@ -375,6 +438,9 @@ func child() error {
 		return fmt.Errorf("sandbox: %w", err)
 	}
 
+	if err := dropBoundingSet(); err != nil {
+		return err
+	}
 	if err := applySeccomp(); err != nil {
 		return err
 	}
