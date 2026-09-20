@@ -664,3 +664,28 @@ These are called out in the brief and will be written up when the code that
 forces them lands: PostgreSQL vs Redis as the queue, leases vs Raft, custom
 runtime vs runc/containerd, the Kubernetes privilege model for workers, cache
 key composition, and queue-depth vs CPU autoscaling.
+
+## 2026-09-20 — The seccomp filter is fuzzed, and the interpreter is grounded
+
+**The fuzzer is Go's native `testing.F`, not a harness of our own.** The
+input space is `(arch, nr, arg0)` and the property is that the compiled BPF
+filter agrees with an independent statement of the policy. The stdlib
+generates, mutates, shrinks and records escapes; adding a generator would be
+code to maintain for what `go test -fuzz` already does. The seed corpus runs
+in the ordinary suite, so the boundaries are checked on every run and every
+architecture, and `make fuzz` explores outward. See
+[seccomp-fuzzer.md](seccomp-fuzzer.md).
+
+**The oracle is written from the policy, not the encoding.** `policyResult`
+decides from `allowedSyscalls` and the clone rule, with none of the filter's
+jumps and masks. The two share the policy — that is the single source of
+truth — and differ in how they express it, which is exactly the jump-overflow
+and fall-through class the filter's own comment warns about.
+
+**`evaluate` is grounded against the kernel once, on purpose.** Every seccomp
+test trusts the pure-Go interpreter to predict the kernel; nothing proved it
+did. `TestInstalledFilterMatchesTheModel` runs the production filter for real
+inside the sandbox and compares the kernel's errno to the model's prediction.
+It is deliberately a curated, safe set — every syscall in it is refused before
+the kernel executes it — rather than a second, live-fire fuzzer, which would
+be a way to corrupt the process, not to test a filter.
