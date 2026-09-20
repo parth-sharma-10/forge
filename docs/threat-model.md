@@ -51,6 +51,7 @@ authenticates. The adversary modelled below starts *after* a job is accepted.
 | 11 | Escape its resource limits | cgroups v2 per job, entered at clone time via `CLONE_INTO_CGROUP` — no uncapped window | `internal/cgroup` | `TestSandboxRunsInsideItsOwnCgroup`, `TestMemoryLimitIsReportedAsAnOOMKill` |
 | 12 | Outlive its job | Context cancel kills PID 1 and the kernel reaps the namespace; `Pdeathsig=SIGKILL` covers a dead worker | `sandbox_linux.go` | `TestContextCancelKillsTheSandbox`, `TestCgroupIsRemovedAfterTheJob` |
 | 13 | Have a stale result accepted | Fencing token per claim; `Heartbeat`/`Report` match only the live token | `internal/queue` | `TestAStaleFenceCannotReportOrHeartbeat`, `TestALateWorkersReportIsRefused`, `make mutate-queue` |
+| 14 | Inherit a host file descriptor across `execve` | Go opens its descriptors `O_CLOEXEC`; the raw `syscall.Exec` closes them, leaving only stdio | `sandbox_linux.go` | `TestNoHostDescriptorLeaksIntoTheBuild` (the CVE-2024-21626 class) |
 
 Two properties fall out of the shape rather than being coded for: a build
 cannot outlive its context by forking away, because killing PID 1 of a PID
@@ -150,7 +151,7 @@ not been reproduced against a running Forge.
 
 | Class | Example | Forge's position |
 |---|---|---|
-| Leaked host file descriptor the runtime holds across the boundary | `CVE-2024-21626` (runc, `/proc/self/fd` working directory) | *Unverified.* The child re-execs `/proc/self/exe` and does its own mounts; there is no runtime-held fd deliberately passed into the container's context. The cgroup fd is passed to `clone3` by the parent, not inherited by the build, and `pivot_root` + `MNT_DETACH` removes the old root before `execve`. Reproducing this is the next piece of work. |
+| Leaked host file descriptor the runtime holds across the boundary | `CVE-2024-21626` (runc, `/proc/self/fd` working directory) | **Verified by test.** The child execs the build with `syscall.Exec`, a raw execve that closes only `O_CLOEXEC` descriptors, so this is a real vector, not a theoretical one. `TestNoHostDescriptorLeaksIntoTheBuild` enumerates the build's `/proc/self/fd` and asserts it inherits only stdio and no filesystem descriptor; injecting a deliberate leak makes it fail, so the pass is meaningful. Go opens its own descriptors `O_CLOEXEC`, and the cgroup fd is the parent's, used by `clone3` and never in the child — the test is what proves the result rather than the argument. |
 | Writable host path bind-mounted in | mounted docker socket, `/proc` or `/sys` from the host | Nothing of the host is mounted except six `/dev` character nodes, each bind-mounted after its major:minor is asserted. No `/sys`, no socket. |
 | `mknod` a block device for the host disk | classic privileged-container escape | Denied twice: the filter answers `mknod` `ENOSYS`, and a user namespace cannot create device nodes regardless. |
 | Abusing `CAP_SYS_ADMIN` to mount or `pivot_root` back out | privileged containers | `CAP_SYS_ADMIN` is not in the bounding set after `execve`, and `mount`/`pivot_root`/`chroot` are not on the allowlist. |
