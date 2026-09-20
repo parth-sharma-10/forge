@@ -52,6 +52,9 @@ func probe(what string) {
 			fmt.Println("socket: ok")
 		}
 		os.Exit(0)
+	case "seccomp-audit":
+		seccompAudit()
+		os.Exit(0)
 	default:
 		fmt.Println("probe: unknown", what)
 		os.Exit(2)
@@ -73,6 +76,36 @@ func probe(what string) {
 	}
 	fmt.Println("clone: ok")
 	os.Exit(0)
+}
+
+// seccompAudit issues each kernel-facing syscall the filter is meant to deny,
+// plus one it allows, and prints the errno the kernel actually returned. It
+// runs inside the sandbox, where the production filter is already installed by
+// Run, so it audits the real thing rather than a re-install. Every syscall
+// here is refused by the filter before the kernel executes it, so the null
+// arguments are never read and nothing happens even if a broken filter let one
+// through.
+//
+// RawSyscall, not a libc wrapper: the wrappers translate ENOSYS into a
+// fallback and would hide exactly the errno being measured.
+func seccompAudit() {
+	denied := []struct {
+		name string
+		trap uintptr
+		a1   uintptr
+	}{
+		{"mount", syscall.SYS_MOUNT, 0},
+		{"sethostname", syscall.SYS_SETHOSTNAME, 0},
+		{"unshare", syscall.SYS_UNSHARE, 0},
+		{"ptrace", syscall.SYS_PTRACE, 0},
+		{"init_module", syscall.SYS_INIT_MODULE, 0},
+	}
+	for _, d := range denied {
+		_, _, errno := syscall.RawSyscall(d.trap, d.a1, 0, 0)
+		fmt.Printf("%s %d\n", d.name, int(errno))
+	}
+	_, _, errno := syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0)
+	fmt.Printf("getpid %d\n", int(errno))
 }
 
 // runProbe copies the test binary into a private image and runs it there as
@@ -717,6 +750,65 @@ func TestSeccompDeniesMount(t *testing.T) {
 	}
 	if out != "denied" {
 		t.Fatalf("mount inside the sandbox = %q, want denied", out)
+	}
+}
+
+// TestInstalledFilterMatchesTheModel grounds the pure-Go evaluate interpreter
+// against the real kernel. Every seccomp test and the fuzzer trust evaluate to
+// predict what the kernel does; this is the one test that proves it, by
+// running the production filter for real and comparing the errno the kernel
+// returns against evaluate's prediction for the same syscall. Without it the
+// fuzzer proves only that the encoding matches the policy map, both written
+// here — this closes the loop to the kernel.
+func TestInstalledFilterMatchesTheModel(t *testing.T) {
+	rootfs(t)
+	out := runProbe(t, "seccomp-audit")
+
+	filter := seccompFilter()
+	trap := map[string]int{
+		"mount":       syscall.SYS_MOUNT,
+		"sethostname": syscall.SYS_SETHOSTNAME,
+		"unshare":     syscall.SYS_UNSHARE,
+		"ptrace":      syscall.SYS_PTRACE,
+		"init_module": syscall.SYS_INIT_MODULE,
+		"getpid":      syscall.SYS_GETPID,
+	}
+	seen := map[string]bool{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var name string
+		var errno int
+		if _, err := fmt.Sscanf(line, "%s %d", &name, &errno); err != nil {
+			t.Fatalf("unparseable audit line %q: %v", line, err)
+		}
+		seen[name] = true
+		nr, ok := trap[name]
+		if !ok {
+			t.Fatalf("audit reported an unexpected syscall %q", name)
+		}
+		got, err := evaluate(filter, auditArch, nr, 0)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		// The model's prediction, as an errno: the deny action carries ENOSYS
+		// in its low 16 bits, an allow means the syscall ran and getpid always
+		// succeeds (errno 0).
+		var wantErrno int
+		switch got {
+		case denyAction:
+			wantErrno = int(denyAction & 0xffff)
+		case retAllow:
+			wantErrno = 0
+		default:
+			t.Fatalf("%s: model returned %#x, neither deny nor allow", name, got)
+		}
+		if errno != wantErrno {
+			t.Errorf("%s: kernel returned errno %d, model predicted %d", name, errno, wantErrno)
+		}
+	}
+	for name := range trap {
+		if !seen[name] {
+			t.Errorf("audit did not report %s", name)
+		}
 	}
 }
 

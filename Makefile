@@ -26,7 +26,7 @@ VM_WORKER_BIN = $(HOME)/.cache/forge/worker.test
 FORGE_TEST_DSN ?=
 VM_DSN ?= postgres://forge:forge@127.0.0.1:5432/forge
 
-.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate mutate-queue bench vm-bench verify-units
+.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate mutate-queue fuzz bench vm-bench verify-units
 
 all: test
 
@@ -117,6 +117,16 @@ mutate:
 ## mutate-queue: the same for the queue, on the host, against FORGE_TEST_DSN
 mutate-queue:
 	FORGE_TEST_DSN=$(FORGE_TEST_DSN) hack/mutate.py --queue
+
+## fuzz: explore the seccomp filter against its policy oracle (Linux, Go, no root)
+# The fuzz target is pure functions — the filter and the evaluate interpreter —
+# so unlike the rest of the sandbox tests it needs neither privileges nor a
+# rootfs, only a Go toolchain on Linux (the package is Linux-only). The seed
+# corpus runs in the ordinary suite; this is the exploring form. Any escape is
+# written to internal/sandbox/testdata/fuzz as a permanent regression seed.
+FUZZTIME ?= 60s
+fuzz:
+	$(GO) test -run '^$$' -fuzz='^FuzzFilterMatchesPolicy$$' -fuzztime=$(FUZZTIME) ./internal/sandbox
 
 ## bench: sandbox setup latency and jobs per second (Linux, root, image, database)
 # The test binaries from test-sandbox, run for their benchmarks only. The

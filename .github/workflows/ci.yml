@@ -32,6 +32,12 @@ jobs:
       - run: make test
       - run: make build
 
+      # Explore the seccomp filter against its policy oracle. The seed corpus
+      # runs in `make test` above; this is the exploring form, bounded so a
+      # shared runner stays fast. An escape is written to testdata/fuzz and
+      # fails the run.
+      - run: make fuzz FUZZTIME=30s
+
       # The isolation tests need a real kernel and CAP_SYS_ADMIN, so they are
       # a separate step: `make test` above runs unprivileged and would skip
       # every one of them. GitHub's runners give passwordless sudo.
