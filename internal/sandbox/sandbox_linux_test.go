@@ -869,6 +869,43 @@ func TestNoHostDescriptorLeaksIntoTheBuild(t *testing.T) {
 	}
 }
 
+// TestTheBuildGetsACleanEnvironment proves the host environment does not reach
+// the build. The child execs with a fixed two-variable environment, so a
+// secret in the worker's environment — a registry token, a database password —
+// cannot leak to untrusted build code through os.Environ. The check is on the
+// property, not an exact set: a shell may add PWD or SHLVL of its own, which is
+// not a leak; a host variable or a Forge-internal one would be.
+func TestTheBuildGetsACleanEnvironment(t *testing.T) {
+	rootfs(t)
+	const sentinel = "FORGE_HOST_SECRET"
+	t.Setenv(sentinel, "this-must-not-reach-the-build")
+
+	out, err := sh(t, "env")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			got[k] = v
+		}
+	}
+	if got["PATH"] != sandboxPATH {
+		t.Errorf("PATH=%q, want the sandbox PATH %q — the host PATH must not leak in", got["PATH"], sandboxPATH)
+	}
+	if got["HOME"] != "/root" {
+		t.Errorf("HOME=%q, want /root", got["HOME"])
+	}
+	if _, ok := got[sentinel]; ok {
+		t.Errorf("build inherited %s — the host environment leaked into the build", sentinel)
+	}
+	for k := range got {
+		if strings.HasPrefix(k, "FORGE_") {
+			t.Errorf("build inherited %s — a Forge-internal variable leaked into the build", k)
+		}
+	}
+}
+
 // TestAnOrdinaryBuildIsUnaffected is the other direction, and the one an
 // allowlist gets wrong: a filter that denies too much passes every test above
 // and breaks every real build. The script is deliberately mundane — files,

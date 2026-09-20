@@ -52,6 +52,7 @@ authenticates. The adversary modelled below starts *after* a job is accepted.
 | 12 | Outlive its job | Context cancel kills PID 1 and the kernel reaps the namespace; `Pdeathsig=SIGKILL` covers a dead worker | `sandbox_linux.go` | `TestContextCancelKillsTheSandbox`, `TestCgroupIsRemovedAfterTheJob` |
 | 13 | Have a stale result accepted | Fencing token per claim; `Heartbeat`/`Report` match only the live token | `internal/queue` | `TestAStaleFenceCannotReportOrHeartbeat`, `TestALateWorkersReportIsRefused`, `make mutate-queue` |
 | 14 | Inherit a host file descriptor across `execve` | Go opens its descriptors `O_CLOEXEC`; the raw `syscall.Exec` closes them, leaving only stdio | `sandbox_linux.go` | `TestNoHostDescriptorLeaksIntoTheBuild` (the CVE-2024-21626 class) |
+| 15 | Read the host's environment | The build is exec'd with a fixed two-variable environment (`PATH`, `HOME`); the worker's environment — where a registry token or DB password lives — is never forwarded | `sandbox_linux.go` | `TestTheBuildGetsACleanEnvironment` |
 
 Two properties fall out of the shape rather than being coded for: a build
 cannot outlive its context by forking away, because killing PID 1 of a PID
