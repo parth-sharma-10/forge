@@ -329,3 +329,7 @@ webhook — a webhook is a client of `POST /jobs` and can live anywhere.
 
 The benchmark numbers above are from one small VM. They are what the
 harness produced there and nothing more.
+
+[docs/threat-model.md](docs/threat-model.md) is the whole of this — what each
+boundary is, the code and test that hold it, and what Forge does not defend
+against at all, the largest being a kernel exploit through an allowed syscall.
