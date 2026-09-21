@@ -17,6 +17,7 @@ import (
 type Counter struct{ n atomic.Int64 }
 
 func (c *Counter) Inc()         { c.n.Add(1) }
+func (c *Counter) Add(n int64)  { c.n.Add(n) }
 func (c *Counter) Value() int64 { return c.n.Load() }
 
 // Gauge goes both ways.

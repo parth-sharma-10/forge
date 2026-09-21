@@ -87,6 +87,14 @@ type Spec struct {
 	// delegated path.
 	CgroupRoot string
 
+	// Observe, if non-nil, is called with the job's cgroup id once the cgroup
+	// exists and before the build starts; the func it returns is called after
+	// the build has exited and before the cgroup is removed. It is the seam the
+	// syscall observer enrols and drains a job through. It must never fail a
+	// build: an error obtaining the id skips observation for that job, and a nil
+	// Observe disables it entirely.
+	Observe func(cgroupID uint64) (done func())
+
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer

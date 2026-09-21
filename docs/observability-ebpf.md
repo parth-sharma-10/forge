@@ -1,9 +1,14 @@
 # eBPF syscall observability — design and the decision it waits on
 
-Status: **designed, not built.** This is the next security-observability layer
-after the seccomp fuzzer and the threat model. It is written down before any
-code because it turns on a dependency decision that is the owner's, exactly as
-the queue's PostgreSQL driver was ([roadmap.md](roadmap.md)).
+Status: **built.** The dependency decision below was taken —
+`github.com/cilium/ebpf`, Forge's second dependency — and the feature shipped in
+`internal/syscalls`, behind the worker's `-syscall-metrics` flag (default off).
+What was actually built and how it is verified is in the last section, [Built](#built);
+the rest of this document is the design it was built from. It is the next
+security-observability layer after the seccomp fuzzer and the threat model,
+and it was written down before any code because it turned on a dependency
+decision that is the owner's, exactly as the queue's PostgreSQL driver was
+([roadmap.md](roadmap.md)).
 
 ## The goal
 
@@ -104,3 +109,52 @@ document and not a pull request.
    syscall to the allowlist.
 4. Attribution is correct under concurrency: two jobs' histograms do not mix —
    proven by a test running two builds with distinct syscall signatures.
+
+## Built
+
+The feature lives in `internal/syscalls`. The worker gains an optional seam,
+`sandbox.Spec.Observe`, called with a job's cgroup id after the cgroup is
+created and before the build starts, returning a drain that runs after the
+build exits and before the cgroup is removed. `cmd/forge-worker` turns it on
+with `-syscall-metrics` (default off); a load failure logs one line and the
+worker runs jobs unobserved.
+
+Two implementation choices sat under the dependency decision:
+
+- **The program is hand-assembled with cilium/ebpf's `asm` package, not
+  compiled from C with clang.** The recommendation above was against
+  hand-rolling `bpf(2)` syscall wrappers and bytecode; using cilium/ebpf as the
+  loader while writing the program's ~20 instructions in Go keeps the one
+  approved dependency, needs no C toolchain in the build, and commits no binary
+  object. It is the seccomp filter's reasoning one size up (`program_linux.go`).
+- **The metric is `forge_job_syscalls_total{nr="N"}`** — an aggregate counter
+  family labelled by syscall number under the build's architecture. A number
+  rather than a name because a portable number-to-name table is a maintenance
+  burden the number does not need; the label's meaning is the arch's syscall
+  table. Per-job attribution is in the mechanism (each job's counts are drained
+  from its own cgroup), not in a per-job label, which would be unbounded
+  cardinality.
+
+The kernel work: one `raw_tracepoint/sys_enter` program, an `enrolled` hash
+(cgroup id → 1) the worker populates per job, and a `counts` per-CPU hash keyed
+by `(cgroup id, syscall nr)`. The program reads `bpf_get_current_cgroup_id`,
+ignores anything not enrolled, and increments the per-CPU counter — no atomic,
+no lock. The cgroup id is the kernfs inode of the job's cgroup directory
+(`cgroup.Group.ID`), which since Linux 5.5 is exactly what the helper returns.
+
+Verification, all in CI (`make test-syscalls`, root + a BTF kernel), because
+none of it runs on macOS:
+
+1. **Per-job histogram in `/metrics`** — the integration test drains a real
+   sandboxed build's counts into the registry and reads them back.
+2. **Graceful degradation** — `TestLoadNeverReturnsABrokenObserver` runs
+   everywhere: off Linux and on an unprivileged Linux host `Load` returns an
+   error and no `Observer`, and the worker's flag path logs and continues.
+3. **The build still cannot touch `bpf`** — unchanged: `bpf` is not on the
+   seccomp allowlist and the existing filter tests prove it is denied; the
+   observability path adds no syscall to the sandbox.
+4. **Attribution does not mix** — the integration test runs an openat-heavy
+   build and a write-heavy build; each is attributed to its own cgroup, and the
+   write-heavy build's openat count stays small while the test process itself
+   makes thousands, which is the proof the filter counts the job and not the
+   machine.

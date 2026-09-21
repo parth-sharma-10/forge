@@ -26,7 +26,7 @@ VM_WORKER_BIN = $(HOME)/.cache/forge/worker.test
 FORGE_TEST_DSN ?=
 VM_DSN ?= postgres://forge:forge@127.0.0.1:5432/forge
 
-.PHONY: all test fmt vet race build clean rootfs test-sandbox vm-test vm-shell mutate mutate-queue fuzz bench vm-bench verify-units
+.PHONY: all test fmt vet race build clean rootfs test-sandbox test-syscalls vm-test vm-shell mutate mutate-queue fuzz bench vm-bench verify-units
 
 all: test
 
@@ -74,6 +74,15 @@ test-sandbox: rootfs
 	sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1
 	sudo /tmp/forge-cgroup.test -test.v -test.count=1
 	sudo FORGE_TEST_ROOTFS=$(ROOTFS) FORGE_TEST_DSN=$(FORGE_TEST_DSN) CI=$(CI) /tmp/forge-worker.test -test.v -test.count=1 -test.run TestEndToEnd
+
+## test-syscalls: the eBPF syscall-observability test, as root (Linux hosts and CI)
+# Separate from test-sandbox because it needs CAP_BPF and a raw_tracepoint on
+# top of CAP_SYS_ADMIN, and it loads a real BPF program into the running
+# kernel. It runs two sandboxed builds and checks each job's syscalls are
+# attributed to its own cgroup.
+test-syscalls: rootfs
+	$(GO) test -c -o /tmp/forge-syscalls.test ./internal/syscalls
+	sudo FORGE_TEST_ROOTFS=$(ROOTFS) CI=$(CI) /tmp/forge-syscalls.test -test.v -test.count=1
 
 ## vm-test: run the sandbox tests inside the colima VM (macOS hosts)
 # colima mounts $HOME into the VM at the same path, so the cross-compiled test

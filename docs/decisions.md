@@ -689,3 +689,34 @@ inside the sandbox and compares the kernel's errno to the model's prediction.
 It is deliberately a curated, safe set — every syscall in it is refused before
 the kernel executes it — rather than a second, live-fire fuzzer, which would
 be a way to corrupt the process, not to test a filter.
+
+## 2026-09-21 — eBPF is the second dependency, and the program is hand-assembled
+
+**`github.com/cilium/ebpf` is Forge's second dependency, after `pgx`.** Per-job
+syscall observability needs a loader that satisfies the verifier, creates and
+reads maps, and attaches a program; hand-rolling `bpf(2)` wrappers and CO-RE is
+days of kernel-fragile code for an observability feature. The dependency was
+the owner's call, held as a document ([observability-ebpf.md](observability-ebpf.md))
+until taken.
+
+Rejected: hand-rolled `bpf(2)`, for the reason above.
+
+**But the program itself is hand-assembled in cilium/ebpf's `asm` package, not
+compiled from C.** The dependency buys the loader; the program is ~20
+instructions — one helper call, two map lookups, an increment — small enough
+that writing it in Go keeps the build free of a C toolchain and commits no
+binary object, while still getting cilium's verifier front-end. Same reasoning
+as the hand-written seccomp filter, one size up.
+
+Rejected: `clang` + `bpf2go` with an embedded object. It is the standard
+pattern and right for a large program, but here it would add a build-time
+toolchain and a committed `.o` for twenty instructions.
+
+**The metric is labelled by syscall number, not name.** A portable
+number-to-name table is a maintenance burden the number itself does not need;
+the label's meaning is the build architecture's syscall table. Revisit if an
+operator asks for names in the exposition rather than at read time.
+
+The feature is behind `-syscall-metrics` (default off) and degrades to a
+logged line on any host that cannot load it, so the common deployment carries
+none of it.
