@@ -66,56 +66,50 @@ func TestSyscallsAreCountedPerJobAndDoNotMix(t *testing.T) {
 		}
 	}
 
-	write := uint64(unix.SYS_WRITE)
+	read, write := uint64(unix.SYS_READ), uint64(unix.SYS_WRITE)
 
 	// Both workloads run entirely in the build's PID 1 shell — the enrolled
 	// cgroup — so the counts come from the process the tracepoint attributes,
 	// not from a forked child whose exec might behave differently in the image.
-	// The two are asserted by the *shape* of their histograms — one dominated
-	// by writes, one not — rather than by a single hard-coded syscall number,
-	// because which number a musl/busybox shell uses to open a file (open vs
-	// openat) is not ours to assume.
+	// They are told apart by read vs write, the two syscalls a shell issues by
+	// their own numbers whatever else it does (a musl/busybox shell opens a
+	// file with open on amd64, not openat, so the open number is not ours to
+	// assume — read and write are).
 	//
-	// file-heavy: a redirect the shell opens and reads 500 times, few writes.
+	// read-heavy: a redirect the shell reads through 500 times.
 	before := snapshotAll(obs)
 	run(t, "i=0; while [ $i -lt 500 ]; do read x < /etc/passwd; i=$((i+1)); done")
 	a := deltaAll(snapshotAll(obs), before)
 
-	// write-heavy: a shell-builtin write, 500 times, opening nothing.
+	// write-heavy: a shell-builtin write 500 times, reading nothing.
 	before = snapshotAll(obs)
 	run(t, "i=0; while [ $i -lt 500 ]; do echo x; i=$((i+1)); done")
 	b := deltaAll(snapshotAll(obs), before)
 
-	t.Logf("file-heavy histogram:  %s", top(a))
+	t.Logf("read-heavy histogram:  %s", top(a))
 	t.Logf("write-heavy histogram: %s", top(b))
 
-	totalA, totalB := total(a), total(b)
-
-	// The write-heavy job's writes are counted, per job.
+	// Each job's own dominant syscall is counted, per job.
+	if a[read] < 1000 {
+		t.Errorf("read-heavy job counted %d read, want >= 1000", a[read])
+	}
 	if b[write] < 200 {
 		t.Errorf("write-heavy job counted %d write, want >= 200", b[write])
 	}
-	// ...and dominate its own histogram: it is a write workload.
-	if b[write] < totalB*6/10 {
-		t.Errorf("write-heavy job: write %d is not the bulk of its %d syscalls", b[write], totalB)
+	// The signatures do not mix: the read-heavy job reads far more than the
+	// write-heavy one, and vice versa for writes.
+	if a[read] <= b[read] {
+		t.Errorf("read did not separate the jobs: read-heavy %d, write-heavy %d", a[read], b[read])
+	}
+	if b[write] <= a[write] {
+		t.Errorf("write did not separate the jobs: write-heavy %d, read-heavy %d", b[write], a[write])
 	}
 	// The cgroup filter attributes to the job, not the machine: the write-heavy
-	// job opens nothing, so its whole non-write count stays small even though
-	// this test process is making thousands of syscalls of every kind
-	// throughout. A broken filter would show the machine's traffic here.
-	if nonWrite := totalB - b[write]; nonWrite > 150 {
-		t.Errorf("write-heavy job counted %d non-write syscalls, want < 150: the filter is leaking the machine's syscalls into the job", nonWrite)
-	}
-	// The file-heavy job did real in-process work, and it is not a write
-	// workload — a distinct signature from the write-heavy job.
-	if totalA < 200 {
-		t.Errorf("file-heavy job counted %d syscalls, want >= 200", totalA)
-	}
-	if a[write] >= b[write] {
-		t.Errorf("the two jobs' write counts did not separate: file-heavy %d, write-heavy %d", a[write], b[write])
-	}
-	if totalA-a[write] < 200 {
-		t.Errorf("file-heavy job's work is not non-write: %d of %d were writes", a[write], totalA)
+	// job barely reads, so its read count stays small even though this test
+	// process reads constantly throughout. A filter counting the machine would
+	// show that traffic here.
+	if b[read] > 200 {
+		t.Errorf("write-heavy job counted %d read, want < 200: the filter is leaking the machine's syscalls into the job", b[read])
 	}
 }
 
@@ -138,14 +132,6 @@ func deltaAll(after, before map[uint64]int64) map[uint64]int64 {
 		}
 	}
 	return d
-}
-
-func total(m map[uint64]int64) int64 {
-	var s int64
-	for _, v := range m {
-		s += v
-	}
-	return s
 }
 
 // top renders a histogram's largest entries, for the test log.
