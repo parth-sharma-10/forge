@@ -65,12 +65,17 @@ func TestSyscallsAreCountedPerJobAndDoNotMix(t *testing.T) {
 
 	openat, write := uint64(unix.SYS_OPENAT), uint64(unix.SYS_WRITE)
 
+	// Both workloads run entirely in the build's PID 1 shell — the enrolled
+	// cgroup — so the counts come from the process the tracepoint attributes,
+	// not from a forked child whose exec might behave differently in the image.
+	// openat-heavy: a redirect the shell opens itself, 500 times.
 	before := snapshot(obs, openat, write)
-	run(t, "i=0; while [ $i -lt 300 ]; do cat /etc/passwd >/dev/null; i=$((i+1)); done")
+	run(t, "i=0; while [ $i -lt 500 ]; do read x < /etc/passwd; i=$((i+1)); done")
 	a := delta(snapshot(obs, openat, write), before)
 
+	// write-heavy: a shell-builtin write, 500 times, opening nothing.
 	before = snapshot(obs, openat, write)
-	run(t, "i=0; while [ $i -lt 1000 ]; do echo x; i=$((i+1)); done")
+	run(t, "i=0; while [ $i -lt 500 ]; do echo x; i=$((i+1)); done")
 	b := delta(snapshot(obs, openat, write), before)
 
 	t.Logf("openat-heavy: openat=%d write=%d | write-heavy: openat=%d write=%d",
