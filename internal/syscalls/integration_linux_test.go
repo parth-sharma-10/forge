@@ -5,10 +5,13 @@ package syscalls
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"sort"
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/unix"
@@ -63,60 +66,108 @@ func TestSyscallsAreCountedPerJobAndDoNotMix(t *testing.T) {
 		}
 	}
 
-	openat, write := uint64(unix.SYS_OPENAT), uint64(unix.SYS_WRITE)
+	write := uint64(unix.SYS_WRITE)
 
 	// Both workloads run entirely in the build's PID 1 shell — the enrolled
 	// cgroup — so the counts come from the process the tracepoint attributes,
 	// not from a forked child whose exec might behave differently in the image.
-	// openat-heavy: a redirect the shell opens itself, 500 times.
-	before := snapshot(obs, openat, write)
+	// The two are asserted by the *shape* of their histograms — one dominated
+	// by writes, one not — rather than by a single hard-coded syscall number,
+	// because which number a musl/busybox shell uses to open a file (open vs
+	// openat) is not ours to assume.
+	//
+	// file-heavy: a redirect the shell opens and reads 500 times, few writes.
+	before := snapshotAll(obs)
 	run(t, "i=0; while [ $i -lt 500 ]; do read x < /etc/passwd; i=$((i+1)); done")
-	a := delta(snapshot(obs, openat, write), before)
+	a := deltaAll(snapshotAll(obs), before)
 
 	// write-heavy: a shell-builtin write, 500 times, opening nothing.
-	before = snapshot(obs, openat, write)
+	before = snapshotAll(obs)
 	run(t, "i=0; while [ $i -lt 500 ]; do echo x; i=$((i+1)); done")
-	b := delta(snapshot(obs, openat, write), before)
+	b := deltaAll(snapshotAll(obs), before)
 
-	t.Logf("openat-heavy: openat=%d write=%d | write-heavy: openat=%d write=%d",
-		a[openat], a[write], b[openat], b[write])
+	t.Logf("file-heavy histogram:  %s", top(a))
+	t.Logf("write-heavy histogram: %s", top(b))
 
-	if a[openat] < 200 {
-		t.Errorf("openat-heavy job counted %d openat, want >= 200", a[openat])
-	}
-	if b[openat] > 100 {
-		t.Errorf("write-heavy job counted %d openat, want < 100: attribution is leaking the machine's syscalls into the job", b[openat])
-	}
-	if a[openat] <= b[openat] {
-		t.Errorf("openat: heavy job %d is not clearly above light job %d", a[openat], b[openat])
-	}
+	totalA, totalB := total(a), total(b)
+
+	// The write-heavy job's writes are counted, per job.
 	if b[write] < 200 {
 		t.Errorf("write-heavy job counted %d write, want >= 200", b[write])
 	}
-	if b[write] <= a[write] {
-		t.Errorf("write: heavy job %d is not above light job %d", b[write], a[write])
+	// ...and dominate its own histogram: it is a write workload.
+	if b[write] < totalB*6/10 {
+		t.Errorf("write-heavy job: write %d is not the bulk of its %d syscalls", b[write], totalB)
+	}
+	// The cgroup filter attributes to the job, not the machine: the write-heavy
+	// job opens nothing, so its whole non-write count stays small even though
+	// this test process is making thousands of syscalls of every kind
+	// throughout. A broken filter would show the machine's traffic here.
+	if nonWrite := totalB - b[write]; nonWrite > 150 {
+		t.Errorf("write-heavy job counted %d non-write syscalls, want < 150: the filter is leaking the machine's syscalls into the job", nonWrite)
+	}
+	// The file-heavy job did real in-process work, and it is not a write
+	// workload — a distinct signature from the write-heavy job.
+	if totalA < 200 {
+		t.Errorf("file-heavy job counted %d syscalls, want >= 200", totalA)
+	}
+	if a[write] >= b[write] {
+		t.Errorf("the two jobs' write counts did not separate: file-heavy %d, write-heavy %d", a[write], b[write])
+	}
+	if totalA-a[write] < 200 {
+		t.Errorf("file-heavy job's work is not non-write: %d of %d were writes", a[write], totalA)
 	}
 }
 
-// snapshot reads the current counter value for each syscall number.
-func snapshot(o *Observer, nrs ...uint64) map[uint64]int64 {
-	m := make(map[uint64]int64, len(nrs))
+// snapshotAll reads every syscall counter's current value.
+func snapshotAll(o *Observer) map[uint64]int64 {
+	m := make(map[uint64]int64, len(o.counters))
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	for _, nr := range nrs {
-		if c := o.counters[nr]; c != nil {
-			m[nr] = c.Value()
-		}
+	for nr, c := range o.counters {
+		m[nr] = c.Value()
 	}
 	return m
 }
 
-func delta(after, before map[uint64]int64) map[uint64]int64 {
+func deltaAll(after, before map[uint64]int64) map[uint64]int64 {
 	d := make(map[uint64]int64, len(after))
 	for k, v := range after {
-		d[k] = v - before[k]
+		if n := v - before[k]; n != 0 {
+			d[k] = n
+		}
 	}
 	return d
+}
+
+func total(m map[uint64]int64) int64 {
+	var s int64
+	for _, v := range m {
+		s += v
+	}
+	return s
+}
+
+// top renders a histogram's largest entries, for the test log.
+func top(m map[uint64]int64) string {
+	type kv struct {
+		nr uint64
+		n  int64
+	}
+	s := make([]kv, 0, len(m))
+	for nr, n := range m {
+		s = append(s, kv{nr, n})
+	}
+	sort.Slice(s, func(i, j int) bool { return s[i].n > s[j].n })
+	var b strings.Builder
+	for i, e := range s {
+		if i >= 12 {
+			fmt.Fprintf(&b, " …(%d more)", len(s)-i)
+			break
+		}
+		fmt.Fprintf(&b, " nr%d=%d", e.nr, e.n)
+	}
+	return b.String()
 }
 
 func mkCgroupRoot(t *testing.T) string {
