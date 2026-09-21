@@ -55,8 +55,12 @@ func buildProgram(enrolled, counts *ebpf.Map) asm.Instructions {
 		asm.FnMapLookupElem.Call(),
 		asm.JNE.Imm(asm.R0, 0, "inc"), // already counted once: increment.
 
-		// First touch of this (cgid, nr): set the count to 1.
-		asm.StoreImm(asm.RFP, oneValue, 1, asm.DWord),
+		// First touch of this (cgid, nr): set the count to 1. Written through a
+		// register — a BPF store-immediate has no double-word form — using R0,
+		// which holds the null lookup result here and is clobbered by the
+		// update call's return regardless.
+		asm.Mov.Imm(asm.R0, 1),
+		asm.StoreMem(asm.RFP, oneValue, asm.R0, asm.DWord),
 		asm.Mov.Reg(asm.R2, asm.RFP),
 		asm.Add.Imm(asm.R2, countsKey),
 		asm.Mov.Reg(asm.R3, asm.RFP),
