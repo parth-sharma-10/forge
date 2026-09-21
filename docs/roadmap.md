@@ -14,6 +14,20 @@ Five phases; all five are complete.
 | 4 | **More than one worker**: leases that expire, fencing that makes a late worker's report harmless, a job that survives its worker | done — [phase-4.md](phase-4.md) |
 | 5 | **Operable**: metrics, a deployment document, and benchmark numbers from a harness | done — [phase-5.md](phase-5.md) |
 
+## v2 — security hardening and assurance
+
+The five phases built and connected the system; v2 proves the isolation
+boundaries hold, writes down where they stop, and plans what comes next. It
+adds no product surface — it adds evidence.
+
+| Item | Delivers | State |
+|---|---|---|
+| Seccomp fuzzer | filter fuzzed against an independent policy oracle; the interpreter grounded on the real kernel | done — [seccomp-fuzzer.md](seccomp-fuzzer.md) (PR #17, merged) |
+| Threat model + isolation tests | per-boundary control→code→test table; what Forge does *not* defend; fd-leak (CVE-2024-21626 class) and clean-environment tests | done — [threat-model.md](threat-model.md) (PR #18) |
+| runc CVE-2024-21626 repro | Forge-side non-vulnerability tested; upstream reproduction planned | Forge half done; upstream deferred — [cve-2024-21626.md](cve-2024-21626.md) (needs a disposable host) |
+| eBPF syscall observability | per-job syscall histograms, non-intrusive, degrading gracefully | designed, waits on a dependency decision — [observability-ebpf.md](observability-ebpf.md) |
+| GPU passthrough (v3) | GPU-capable sandbox, isolation trade-offs made explicit | analysed, deferred — [gpu-forge-v3.md](gpu-forge-v3.md) (needs hardware + an isolation decision) |
+
 ## Phase 2 — worker and queue
 
 The target shape in [architecture.md](architecture.md) puts the queue in

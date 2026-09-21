@@ -55,6 +55,9 @@ func probe(what string) {
 	case "seccomp-audit":
 		seccompAudit()
 		os.Exit(0)
+	case "fd-leak":
+		fdLeak()
+		os.Exit(0)
 	default:
 		fmt.Println("probe: unknown", what)
 		os.Exit(2)
@@ -106,6 +109,27 @@ func seccompAudit() {
 	}
 	_, _, errno := syscall.RawSyscall(syscall.SYS_GETPID, 0, 0, 0)
 	fmt.Printf("getpid %d\n", int(errno))
+}
+
+// fdLeak lists every file descriptor the build inherited across the child's
+// syscall.Exec, with what each points at. The child execs with the raw
+// execve — which closes only O_CLOEXEC descriptors — so anything the child
+// held open without that flag reaches the build. A leaked descriptor to a
+// host directory is the CVE-2024-21626 escape primitive: the build reopens it
+// through /proc/self/fd and walks out of the sandbox with it.
+func fdLeak() {
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		fmt.Println("readdir:", err)
+		return
+	}
+	for _, e := range ents {
+		target, err := os.Readlink("/proc/self/fd/" + e.Name())
+		if err != nil {
+			target = "unreadable: " + err.Error()
+		}
+		fmt.Printf("fd %s -> %s\n", e.Name(), target)
+	}
 }
 
 // runProbe copies the test binary into a private image and runs it there as
@@ -808,6 +832,76 @@ func TestInstalledFilterMatchesTheModel(t *testing.T) {
 	for name := range trap {
 		if !seen[name] {
 			t.Errorf("audit did not report %s", name)
+		}
+	}
+}
+
+// TestNoHostDescriptorLeaksIntoTheBuild is the CVE-2024-21626 class, checked
+// against Forge rather than argued about. The child execs the build with
+// syscall.Exec, a raw execve that closes only O_CLOEXEC descriptors, so a
+// single host directory descriptor held open without that flag would let the
+// build reach the host filesystem through /proc/self/fd. The build should
+// inherit stdin, stdout and stderr and nothing that touches the filesystem —
+// the one allowed extra is the descriptor ReadDir itself holds open over
+// /proc/self/fd while listing it.
+func TestNoHostDescriptorLeaksIntoTheBuild(t *testing.T) {
+	rootfs(t)
+	out := runProbe(t, "fd-leak")
+
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		var fd int
+		var target string
+		if _, err := fmt.Sscanf(line, "fd %d -> %s", &fd, &target); err != nil {
+			t.Fatalf("unparseable fd line %q: %v", line, err)
+		}
+		if fd <= 2 {
+			continue // stdin/stdout/stderr, wired to the worker's pipes
+		}
+		// The only descriptor above 2 is ReadDir's own handle on
+		// /proc/self/fd. Anything else pointing into a real filesystem — a
+		// path, not a pipe/socket/anon_inode — is a leak.
+		if strings.HasPrefix(target, "/proc/") {
+			continue
+		}
+		if strings.HasPrefix(target, "/") {
+			t.Errorf("build inherited fd %d pointing at %q — a host filesystem descriptor leaked across execve", fd, target)
+		}
+	}
+}
+
+// TestTheBuildGetsACleanEnvironment proves the host environment does not reach
+// the build. The child execs with a fixed two-variable environment, so a
+// secret in the worker's environment — a registry token, a database password —
+// cannot leak to untrusted build code through os.Environ. The check is on the
+// property, not an exact set: a shell may add PWD or SHLVL of its own, which is
+// not a leak; a host variable or a Forge-internal one would be.
+func TestTheBuildGetsACleanEnvironment(t *testing.T) {
+	rootfs(t)
+	const sentinel = "FORGE_HOST_SECRET"
+	t.Setenv(sentinel, "this-must-not-reach-the-build")
+
+	out, err := sh(t, "env")
+	if err != nil {
+		t.Fatalf("run: %v (output %q)", err, out)
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			got[k] = v
+		}
+	}
+	if got["PATH"] != sandboxPATH {
+		t.Errorf("PATH=%q, want the sandbox PATH %q — the host PATH must not leak in", got["PATH"], sandboxPATH)
+	}
+	if got["HOME"] != "/root" {
+		t.Errorf("HOME=%q, want /root", got["HOME"])
+	}
+	if _, ok := got[sentinel]; ok {
+		t.Errorf("build inherited %s — the host environment leaked into the build", sentinel)
+	}
+	for k := range got {
+		if strings.HasPrefix(k, "FORGE_") {
+			t.Errorf("build inherited %s — a Forge-internal variable leaked into the build", k)
 		}
 	}
 }
