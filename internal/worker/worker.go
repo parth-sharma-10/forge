@@ -66,13 +66,20 @@ type Worker struct {
 	// for observation while it runs. nil means jobs run unobserved.
 	Observe func(cgroupID uint64) (done func())
 
+	// Timeout is the wall-clock limit on one build. Zero means no limit — the
+	// lease and its heartbeats are then the only thing that ever stops a job,
+	// so a build that keeps heartbeating runs forever. A crossed deadline
+	// cancels the build's context, which the sandbox turns into SIGKILL of its
+	// PID 1, and the job is reported as timed out.
+	Timeout time.Duration
+
 	claimed, leaseLost *metrics.Counter
 	done               map[string]*metrics.Counter
 	running            *metrics.Gauge
 }
 
 // outcomes are the labels of forge_jobs_done_total.
-var outcomes = []string{"ok", "failed", "oom", "killed", "setup", "given_up"}
+var outcomes = []string{"ok", "failed", "oom", "killed", "setup", "given_up", "timeout"}
 
 const (
 	defaultLease       = 30 * time.Second
@@ -193,6 +200,9 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 
 	w.running.Inc()
 	buildCtx, cancelBuild := context.WithCancel(ctx)
+	if w.Timeout > 0 {
+		buildCtx, cancelBuild = context.WithTimeout(ctx, w.Timeout)
+	}
 	defer cancelBuild()
 
 	log := &tail{limit: w.LogLimit}
@@ -236,7 +246,18 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 
 	r := result(err)
 	r.Log = log.Log()
-	w.done[outcome(r)].Inc()
+	out := outcome(r)
+	// A deadline on buildCtx is the timeout, and only the timeout: a lost
+	// lease or an operator's kill cancels the context, they do not expire it.
+	// It reads the same SIGKILL as any other kill otherwise, so the reason has
+	// to come from the context, before the report overwrites nothing.
+	if errors.Is(buildCtx.Err(), context.DeadlineExceeded) {
+		out = "timeout"
+		if r.Error == "" {
+			r.Error = fmt.Sprintf("timed out after %s", w.Timeout)
+		}
+	}
+	w.done[out].Inc()
 	if err := w.Store.Report(ctx, job, r); err != nil {
 		w.Log.Warn("report failed", "job", job.ID, "err", err)
 		return
