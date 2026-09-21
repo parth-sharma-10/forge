@@ -40,6 +40,9 @@ type Worker struct {
 	Limits cgroup.Limits
 	// CgroupRoot is passed through to the sandbox; empty means the default.
 	CgroupRoot string
+	// ScratchBytes caps each job's writable overlay layer and its inode count.
+	// Zero leaves it bounded only by the memory limit. Passed to sandbox.Spec.
+	ScratchBytes int64
 
 	// Lease is how long a claim holds without a heartbeat. Heartbeats go
 	// out every third of it or every two seconds, whichever is sooner —
@@ -229,13 +232,14 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 	}()
 
 	err := w.Run(buildCtx, sandbox.Spec{
-		Rootfs:     w.Rootfs,
-		Args:       job.Args,
-		Limits:     w.Limits,
-		CgroupRoot: w.CgroupRoot,
-		Observe:    w.Observe,
-		Stdout:     log,
-		Stderr:     log,
+		Rootfs:       w.Rootfs,
+		Args:         job.Args,
+		Limits:       w.Limits,
+		CgroupRoot:   w.CgroupRoot,
+		ScratchBytes: w.ScratchBytes,
+		Observe:      w.Observe,
+		Stdout:       log,
+		Stderr:       log,
 	})
 	cancelBuild()
 	<-heartbeatDone

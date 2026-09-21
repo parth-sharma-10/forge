@@ -56,6 +56,7 @@ const SetupExitCode = 125
 const (
 	envRootfs   = "FORGE_SANDBOX_ROOTFS"
 	envHostname = "FORGE_SANDBOX_HOSTNAME"
+	envScratch  = "FORGE_SANDBOX_SCRATCH_BYTES"
 
 	defaultHostname = "forge"
 )
@@ -86,6 +87,14 @@ type Spec struct {
 	// Empty means cgroup.DefaultRoot; under systemd delegation, pass the
 	// delegated path.
 	CgroupRoot string
+
+	// ScratchBytes caps the writable overlay layer — everything a build
+	// creates or changes — in bytes, and its inode count with it. Zero means
+	// no cap of its own, in which case the layer is bounded only by the
+	// cgroup's memory limit (the tmpfs pages are charged to it). A cap here
+	// makes a build filling the disk fail with ENOSPC rather than an OOM kill,
+	// and bounds inode exhaustion, which a memory limit alone does not.
+	ScratchBytes int64
 
 	// Observe, if non-nil, is called with the job's cgroup id once the cgroup
 	// exists and before the build starts; the func it returns is called after
