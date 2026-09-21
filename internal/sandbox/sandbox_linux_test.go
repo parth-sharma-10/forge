@@ -649,16 +649,18 @@ func TestSandboxRunsInsideItsOwnCgroup(t *testing.T) {
 		Rootfs:     rootfs(t),
 		CgroupRoot: root,
 		Limits:     cgroup.Limits{MemoryBytes: 64 << 20},
-		// /proc is the sandbox's own mount, and without a cgroup namespace
-		// this reports the full path from the cgroup root.
+		// The cgroup namespace roots /proc/self/cgroup at the job's own cgroup,
+		// so the process sees itself at "0::/": both proof it is in a cgroup of
+		// its own and that the host path (root/job-XXXX) is hidden from it. The
+		// memory-limit tests prove that cgroup is real and enforcing; the host
+		// side still sees the job under root, which is what the namespace hides.
 		Args: []string{"/bin/sh", "-c", "cat /proc/self/cgroup"},
 	})
 	if err != nil {
 		t.Fatalf("run: %v (output %q)", err, out)
 	}
-	want := strings.TrimPrefix(root, "/sys/fs/cgroup") + "/job-"
-	if !strings.Contains(out, want) {
-		t.Fatalf("/proc/self/cgroup = %q, want it under %q", out, want)
+	if out != "0::/" {
+		t.Fatalf("/proc/self/cgroup = %q, want %q: rooted at the job's own cgroup by the cgroup namespace", out, "0::/")
 	}
 }
 

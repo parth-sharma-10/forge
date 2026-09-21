@@ -38,9 +38,11 @@ func main() {
 		lease          = flag.Duration("lease", 30*time.Second, "how long a claim holds without a heartbeat")
 		poll           = flag.Duration("poll", time.Second, "how long to wait after finding the queue empty")
 		attempts       = flag.Int("max-attempts", 3, "claims a job may take before it is given up")
+		timeout        = flag.Duration("timeout", time.Hour, "wall-clock limit on one build; 0 for no limit")
 		memoryMB       = flag.Int64("memory-mb", 0, "memory limit per job in MiB (0 for unlimited)")
 		cpuCores       = flag.Float64("cpu", 0, "CPU limit per job in cores (0 for unlimited)")
 		maxPIDs        = flag.Int("pids", 0, "maximum processes per job (0 for unlimited)")
+		diskMB         = flag.Int64("disk-mb", 0, "writable-layer (disk + inode) limit per job in MiB (0 for unlimited)")
 		cgroupRoot     = flag.String("cgroup-root", cgroup.DefaultRoot, "parent cgroup for the jobs' cgroups")
 		metricsAt      = flag.String("metrics", "", "address to serve /metrics on (empty for none)")
 		syscallMetrics = flag.Bool("syscall-metrics", false, "count each job's syscalls via eBPF and export them (Linux, needs CAP_BPF; off is a no-op)")
@@ -89,8 +91,9 @@ func main() {
 
 	w := &worker.Worker{
 		Store: q, Name: *name, Rootfs: *rootfs, CgroupRoot: *cgroupRoot,
-		Limits: cgroup.Limits{MemoryBytes: *memoryMB << 20, CPUCores: *cpuCores, MaxPIDs: *maxPIDs},
-		Lease:  *lease, Poll: *poll, MaxAttempts: *attempts, Log: log, Metrics: &reg,
+		Limits:       cgroup.Limits{MemoryBytes: *memoryMB << 20, CPUCores: *cpuCores, MaxPIDs: *maxPIDs},
+		ScratchBytes: *diskMB << 20,
+		Lease:        *lease, Poll: *poll, MaxAttempts: *attempts, Timeout: *timeout, Log: log, Metrics: &reg,
 	}
 
 	if *syscallMetrics {

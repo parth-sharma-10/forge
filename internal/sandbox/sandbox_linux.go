@@ -25,15 +25,19 @@ import (
 // owned by it, so the child holds CAP_SYS_ADMIN *in them* — enough to mount and
 // pivot_root — while holding nothing on the host side of the same boundary.
 //
-// Not here yet: CLONE_NEWCGROUP. The seccomp filter is not a clone flag: it is
-// installed by the child on itself, last, once the setup syscalls it denies are
-// no longer needed. See seccomp_linux.go.
+// The cgroup namespace roots /proc/self/cgroup at the job's own cgroup: the
+// build cannot read where on the host it sits, only "0::/". It is created in
+// the same clone that places the child in the cgroup (UseCgroupFD below), so
+// the namespace root is the job cgroup rather than the host's. The seccomp
+// filter is not a clone flag: it is installed by the child on itself, last,
+// once the setup syscalls it denies are no longer needed. See seccomp_linux.go.
 const namespaces = syscall.CLONE_NEWUSER | // user:    sandbox root is an unprivileged host uid
-	syscall.CLONE_NEWNS | //  mount:   its own filesystem tree
-	syscall.CLONE_NEWUTS | // uts:     its own hostname
-	syscall.CLONE_NEWIPC | // ipc:     no shared memory or message queues
-	syscall.CLONE_NEWPID | // pid:     the command is PID 1 and sees no host process
-	syscall.CLONE_NEWNET //  network: no interfaces at all, not even routed ones
+	syscall.CLONE_NEWNS | //     mount:   its own filesystem tree
+	syscall.CLONE_NEWUTS | //    uts:     its own hostname
+	syscall.CLONE_NEWIPC | //    ipc:     no shared memory or message queues
+	syscall.CLONE_NEWPID | //    pid:     the command is PID 1 and sees no host process
+	syscall.CLONE_NEWCGROUP | // cgroup:  /proc/self/cgroup is rooted at the job's cgroup
+	syscall.CLONE_NEWNET //      network: no interfaces at all, not even routed ones
 
 // The sandbox's id map: uid 0 inside is uid mappedBase outside, and the 65536
 // ids the sandbox can name run from there. A range rather than the single id
@@ -95,6 +99,7 @@ func Run(ctx context.Context, spec Spec) error {
 	cmd.Env = []string{
 		envRootfs + "=" + spec.Rootfs,
 		envHostname + "=" + spec.Hostname,
+		envScratch + "=" + strconv.FormatInt(spec.ScratchBytes, 10),
 	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = spec.Stdin, spec.Stdout, spec.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
@@ -187,11 +192,19 @@ func mountProc(rootfs string) error {
 // this runs on it makes no difference anyone has observed (docs/decisions.md,
 // 2026-09-16); it is the documented option for a mount made from a user
 // namespace, and it is kept for the kernels that are not Ubuntu's.
-func mountOverlay(rootfs string) error {
+func mountOverlay(rootfs string, scratchBytes int64) error {
 	if err := syscall.Chdir(rootfs); err != nil {
 		return fmt.Errorf("sandbox: chdir %s: %w", rootfs, err)
 	}
-	if err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, "mode=0755"); err != nil {
+	// size caps the disk a build can use; nr_inodes caps the files it can
+	// create, which a byte cap alone does not — an inode is charged whatever
+	// its file's size. One inode per 4 KiB of cap, plus a floor so upper/ and
+	// work/ and a small build always have room.
+	tmpfsOpts := "mode=0755"
+	if scratchBytes > 0 {
+		tmpfsOpts = fmt.Sprintf("mode=0755,size=%d,nr_inodes=%d", scratchBytes, scratchBytes/4096+64)
+	}
+	if err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, tmpfsOpts); err != nil {
 		return fmt.Errorf("sandbox: mount scratch tmpfs on %s: %w", rootfs, err)
 	}
 	upper, work := filepath.Join(rootfs, "upper"), filepath.Join(rootfs, "work")
@@ -410,7 +423,10 @@ func child() error {
 	if err := syscall.Mount("none", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("sandbox: make mounts private: %w", err)
 	}
-	if err := mountOverlay(rootfs); err != nil {
+	// A parse error means the parent set it wrong, which is a bug, not a build
+	// error; zero (its zero value on ParseInt failure) is the no-cap default.
+	scratchBytes, _ := strconv.ParseInt(os.Getenv(envScratch), 10, 64)
+	if err := mountOverlay(rootfs, scratchBytes); err != nil {
 		return err
 	}
 
