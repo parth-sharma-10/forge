@@ -42,6 +42,10 @@ jobs:
       # a separate step: `make test` above runs unprivileged and would skip
       # every one of them. GitHub's runners give passwordless sudo.
       - run: make test-sandbox
+      # The syscall-observability test loads a real eBPF program and attaches
+      # it to a raw tracepoint, then checks per-job attribution. Root, its own
+      # step for the same reason test-sandbox is one.
+      - run: make test-syscalls
       # The benchmarks run for their numbers, which are logged and not
       # asserted: a shared runner's timings are not a gate.
       - run: make bench

@@ -61,6 +61,11 @@ type Worker struct {
 	// of the worker's own that nothing scrapes.
 	Metrics *metrics.Registry
 
+	// Observe, if non-nil, is the syscall observer's per-job seam: it is
+	// passed through to every job's sandbox.Spec so a job's cgroup is enrolled
+	// for observation while it runs. nil means jobs run unobserved.
+	Observe func(cgroupID uint64) (done func())
+
 	claimed, leaseLost *metrics.Counter
 	done               map[string]*metrics.Counter
 	running            *metrics.Gauge
@@ -218,6 +223,7 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		Args:       job.Args,
 		Limits:     w.Limits,
 		CgroupRoot: w.CgroupRoot,
+		Observe:    w.Observe,
 		Stdout:     log,
 		Stderr:     log,
 	})

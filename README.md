@@ -226,6 +226,14 @@ up, lost the lease on, and has in hand. Prometheus text format, written by
 hand — no client library. [docs/deployment.md](docs/deployment.md) has the
 table and what each one rising means.
 
+Add `-syscall-metrics` and each job's syscalls are counted through an eBPF
+`raw_tracepoint`, attributed to the job by its cgroup, and exported as
+`forge_job_syscalls_total{nr=...}` — which of the allowed syscalls builds
+actually reach for. It runs outside the sandbox, adds nothing to what a build
+can do, needs `CAP_BPF`, and logs one line and stays off where it cannot load.
+[docs/observability-ebpf.md](docs/observability-ebpf.md) has the design and
+what was built.
+
 ### Numbers
 
 From `make bench` in CI on a GitHub-hosted `ubuntu-latest` runner (x86_64,

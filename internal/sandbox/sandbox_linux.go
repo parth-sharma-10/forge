@@ -77,6 +77,20 @@ func Run(ctx context.Context, spec Spec) error {
 	}
 	defer group.Close()
 
+	// Enrol the job for syscall observation, if a caller asked for it, before
+	// the build starts, and drain it after the build exits and before the
+	// cgroup is removed. Observation must never fail a build: a cgroup whose
+	// id cannot be read is simply not observed. The drain defer is registered
+	// after group.Close's so it runs first (LIFO): the counts are read while
+	// the cgroup id is still the build's alone.
+	if spec.Observe != nil {
+		if id, idErr := group.ID(); idErr == nil {
+			if done := spec.Observe(id); done != nil {
+				defer done()
+			}
+		}
+	}
+
 	cmd := exec.CommandContext(ctx, "/proc/self/exe", append([]string{ChildArg}, spec.Args...)...)
 	cmd.Env = []string{
 		envRootfs + "=" + spec.Rootfs,

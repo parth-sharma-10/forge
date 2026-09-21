@@ -113,6 +113,18 @@ func (g *Group) Path() string { return g.path }
 // FD is the directory file descriptor for SysProcAttr.CgroupFD.
 func (g *Group) FD() int { return int(g.dir.Fd()) }
 
+// ID is the cgroup's id: the kernfs inode number of its directory. Since
+// Linux 5.5 this is exactly what bpf_get_current_cgroup_id returns for a task
+// in the cgroup, which is how per-job syscall observability attributes a
+// syscall to the job that made it (docs/observability-ebpf.md).
+func (g *Group) ID() (uint64, error) {
+	var st syscall.Stat_t
+	if err := syscall.Fstat(int(g.dir.Fd()), &st); err != nil {
+		return 0, fmt.Errorf("cgroup: stat %s for its id: %w", g.path, err)
+	}
+	return uint64(st.Ino), nil
+}
+
 // OOMKilled reports whether the kernel killed anything in this cgroup for
 // exceeding its memory limit.
 //
