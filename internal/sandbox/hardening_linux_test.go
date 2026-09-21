@@ -8,22 +8,8 @@ import (
 	"testing"
 )
 
-// TestCgroupNamespaceHidesTheHostCgroupPath: with CLONE_NEWCGROUP the build's
-// /proc/self/cgroup is rooted at its own cgroup, so it cannot read the host
-// path it actually sits at — no "forge/job-XXXX" leaks through.
-func TestCgroupNamespaceHidesTheHostCgroupPath(t *testing.T) {
-	out, err := sh(t, "cat /proc/self/cgroup")
-	if err != nil {
-		t.Fatalf("run: %v (output %q)", err, out)
-	}
-	// v2 lines are "0::<path>"; namespaced, the path is "/".
-	if !strings.HasPrefix(out, "0::") {
-		t.Fatalf("/proc/self/cgroup = %q, not a cgroup v2 line", out)
-	}
-	if strings.Contains(out, "job-") || strings.Contains(out, "/forge") {
-		t.Fatalf("/proc/self/cgroup = %q leaks the host cgroup path; the cgroup namespace is not hiding it", out)
-	}
-}
+// The cgroup namespace is covered by TestSandboxRunsInsideItsOwnCgroup, which
+// asserts /proc/self/cgroup is rooted at the job's own cgroup ("0::/").
 
 // TestTheDiskLimitStopsAHostileFill: a build that tries to fill the disk past
 // its scratch limit gets ENOSPC, not the host's free space. A build inside the
@@ -62,7 +48,9 @@ func TestTheInodeLimitStopsFileExhaustion(t *testing.T) {
 
 	out, err := runSpec(t, Spec{
 		Rootfs: rootfs(t), Hostname: "forge-test", ScratchBytes: cap,
-		Args: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 8000 ]; do : > /f$i || break; i=$((i+1)); done; echo made $i"},
+		// echo, not the special builtin ":", whose redirect failure is fatal to
+		// the shell rather than something "|| break" can catch.
+		Args: []string{"/bin/sh", "-c", "i=0; while [ $i -lt 8000 ]; do echo x > /f$i 2>/dev/null || break; i=$((i+1)); done; echo made $i"},
 	})
 	if err != nil {
 		t.Fatalf("run: %v (output %q)", err, out)
