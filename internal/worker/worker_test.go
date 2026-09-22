@@ -360,3 +360,22 @@ func TestAJobClaimedAlreadyCancelledIsNotRun(t *testing.T) {
 		t.Fatalf("reported %+v (ran: %v), want cancelled without running", r, ran)
 	}
 }
+
+// TestACancelledJobPastItsAttemptCapIsReportedCancelled: a job reclaimed more
+// often than MaxAttempts after being cancelled says cancelled, not given up —
+// the operator's cancel is why it stopped.
+func TestACancelledJobPastItsAttemptCapIsReportedCancelled(t *testing.T) {
+	store := newStore([]string{"never"})
+	store.jobs[0].Cancelled = true
+	store.jobs[0].Attempt = 9
+	w := &Worker{Store: store, Lease: time.Second, Poll: 10 * time.Millisecond, MaxAttempts: 3}
+	w.Run = func(context.Context, sandbox.Spec) error {
+		t.Error("a cancelled job was run")
+		return nil
+	}
+	serve(t, w)
+
+	if r := store.waitReport(t); r.Error != queue.ReasonCancelled {
+		t.Fatalf("reported %+v, want error %q", r, queue.ReasonCancelled)
+	}
+}
