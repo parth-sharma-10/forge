@@ -157,15 +157,20 @@ func TestClaimIsExclusive(t *testing.T) {
 func TestAnExpiredLeaseIsReclaimed(t *testing.T) {
 	q, ctx := open(t), context.Background()
 	id, _ := q.Submit(ctx, []string{"true"})
-	first, err := q.Claim(ctx, "w1", 50*time.Millisecond)
+	// The live-lease claim below must land inside the lease: at 50ms a -race
+	// build on a two-core runner can miss it, as TestHeartbeatExtendsTheLease
+	// did. The job it gets, if any, is named, so a failure says whether the
+	// lease ran out (this job) or another package's row leaked in (not this job).
+	const lease = 500 * time.Millisecond
+	first, err := q.Claim(ctx, "w1", lease)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Claim(ctx, "w2", time.Minute); !errors.Is(err, ErrEmpty) {
-		t.Fatalf("claim while the lease is live: %v, want ErrEmpty", err)
+	if got, err := q.Claim(ctx, "w2", time.Minute); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("claim while the lease is live: got job %d (args %q), %v; want ErrEmpty", got.ID, got.Args, err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(lease + 200*time.Millisecond)
 	second, err := q.Claim(ctx, "w2", time.Minute)
 	if err != nil {
 		t.Fatalf("claim after the lease expired: %v", err)
