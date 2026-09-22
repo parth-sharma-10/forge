@@ -67,6 +67,14 @@ authentication of its own: put it behind whatever does — a reverse proxy
 with client certificates or a bearer token — and never on an interface a
 build can reach. `/metrics` is on the same listener.
 
+**Starting.** Before it claims anything, the worker builds one complete
+sandbox and runs nothing in it. It also checks that the image is shifted into
+the uid map. If either fails, it exits 1 with the reason: missing delegation,
+a masked `/proc`, an unshifted image. The alternative is a worker that takes
+every job in the queue and reports each one as a setup failure. A unit that
+restart-loops on start is the preflight doing its job; `journalctl -u
+forge-worker` has the reason.
+
 **Stopping.** `systemctl stop forge-worker` sends `SIGTERM`, which drains:
 the jobs in hand finish, no more are claimed. `TimeoutStopSec=300` is how
 long a build gets; past it systemd's `SIGKILL` takes the worker and, through

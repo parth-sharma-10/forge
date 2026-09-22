@@ -57,6 +57,9 @@ const (
 	envRootfs   = "FORGE_SANDBOX_ROOTFS"
 	envHostname = "FORGE_SANDBOX_HOSTNAME"
 	envScratch  = "FORGE_SANDBOX_SCRATCH_BYTES"
+	// envPreflight makes the child build the whole sandbox and exit 0 in
+	// place of exec'ing anything. See Preflight.
+	envPreflight = "FORGE_SANDBOX_PREFLIGHT"
 
 	defaultHostname = "forge"
 )
@@ -107,6 +110,8 @@ type Spec struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	preflight bool
 }
 
 func (s *Spec) validate() error {
