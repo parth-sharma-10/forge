@@ -32,11 +32,16 @@ type Observer struct {
 	counts   *ebpf.Map
 	prog     *ebpf.Program
 	link     link.Link
+	// exitProg and exitLink count ENOSYS returns; nil where the sys_exit
+	// tracepoint could not be attached, which leaves the histogram working.
+	exitProg *ebpf.Program
+	exitLink link.Link
 	log      *slog.Logger
 
 	reg *metrics.Registry
 	mu  sync.Mutex
-	// counters memoises one *metrics.Counter per syscall number so a drain
+	// counters memoises one *metrics.Counter per counts-map key number (the
+	// syscall number, tagged with enosysTag for an ENOSYS return) so a drain
 	// adds to the same series the last drain created.
 	counters map[uint64]*metrics.Counter
 }
@@ -87,10 +92,35 @@ func Load(reg *metrics.Registry, log *slog.Logger) (*Observer, error) {
 		enrolled.Close()
 		return nil, fmt.Errorf("syscalls: attach sys_enter: %w", err)
 	}
-	return &Observer{
+	o := &Observer{
 		enrolled: enrolled, counts: counts, prog: prog, link: lnk,
 		log: log, reg: reg, counters: map[uint64]*metrics.Counter{},
-	}, nil
+	}
+	if err := o.attachExit(); err != nil {
+		log.Warn("syscall observability: ENOSYS counting off, the histogram is unaffected", "err", err)
+	}
+	return o, nil
+}
+
+// attachExit loads and attaches the ENOSYS counter. Its failure is logged and
+// survived: the sys_enter histogram does not depend on it.
+func (o *Observer) attachExit() error {
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Name:         "forge_enosys",
+		Type:         ebpf.TracePoint,
+		Instructions: buildExitProgram(o.enrolled, o.counts),
+		License:      "GPL",
+	})
+	if err != nil {
+		return fmt.Errorf("syscalls: load exit program: %w", err)
+	}
+	lnk, err := link.Tracepoint("raw_syscalls", "sys_exit", prog, nil)
+	if err != nil {
+		prog.Close()
+		return fmt.Errorf("syscalls: attach raw_syscalls:sys_exit: %w", err)
+	}
+	o.exitProg, o.exitLink = prog, lnk
+	return nil
 }
 
 // Job returns the sandbox.Spec.Observe callback: it enrols a job's cgroup on
@@ -148,16 +178,19 @@ func (o *Observer) drain(cgroupID uint64) {
 	}
 }
 
-// counter returns the counter for a syscall number, creating it once.
-func (o *Observer) counter(nr uint64) *metrics.Counter {
+// counter returns the counter for a counts-map key number, creating it once:
+// the syscall histogram's, or the ENOSYS count's for a tagged key.
+func (o *Observer) counter(key uint64) *metrics.Counter {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	c := o.counters[nr]
+	c := o.counters[key]
 	if c == nil {
-		c = o.reg.Counter(MetricName,
-			"Syscalls made by builds, by number under the build's architecture.",
-			map[string]string{"nr": strconv.FormatUint(nr, 10)})
-		o.counters[nr] = c
+		name, help := MetricName, "Syscalls made by builds, by number under the build's architecture."
+		if key&enosysTag != 0 {
+			name, help = EnosysMetricName, "Syscalls by builds that returned ENOSYS: denied by the seccomp filter, or not implemented."
+		}
+		c = o.reg.Counter(name, help, map[string]string{"nr": strconv.FormatUint(key&^enosysTag, 10)})
+		o.counters[key] = c
 	}
 	return c
 }
@@ -166,6 +199,10 @@ func (o *Observer) counter(nr uint64) *metrics.Counter {
 func (o *Observer) Close() error {
 	err := o.link.Close()
 	o.prog.Close()
+	if o.exitLink != nil {
+		err = errors.Join(err, o.exitLink.Close())
+		o.exitProg.Close()
+	}
 	o.counts.Close()
 	o.enrolled.Close()
 	return err
