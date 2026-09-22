@@ -23,6 +23,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/parth-sharma-10/forge/internal/queue"
+	"github.com/parth-sharma-10/forge/internal/queue/queuetest"
 	"github.com/parth-sharma-10/forge/internal/sandbox"
 )
 
@@ -82,6 +83,7 @@ func openQueue(t testing.TB) *queue.Queue {
 		}
 		t.Skipf("%s not set", dsnEnv)
 	}
+	queuetest.Exclusive(t, dsn)
 	ctx := context.Background()
 	q, err := queue.Open(ctx, dsn)
 	if err != nil {

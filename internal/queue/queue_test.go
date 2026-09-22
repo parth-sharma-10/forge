@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/parth-sharma-10/forge/internal/queue/queuetest"
 )
 
 const dsnEnv = "FORGE_TEST_DSN"
@@ -25,6 +27,7 @@ func open(t *testing.T) *Queue {
 		}
 		t.Skipf("%s not set: e.g. postgres://forge@127.0.0.1:5432/postgres", dsnEnv)
 	}
+	queuetest.Exclusive(t, dsn)
 	q, err := Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
