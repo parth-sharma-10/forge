@@ -724,12 +724,14 @@ func TestACgroupThatCannotBeRemovedIsReported(t *testing.T) {
 		CgroupRoot: root,
 		Args:       []string{"/bin/true"},
 		Observe: func(uint64) func() {
-			entries, err := os.ReadDir(root)
-			if err != nil || len(entries) == 0 {
-				t.Errorf("no job cgroup under %s: %v", root, err)
+			// The root also holds the kernel's interface files; the job is
+			// the one directory named job-*.
+			jobs, err := filepath.Glob(filepath.Join(root, "job-*"))
+			if err != nil || len(jobs) != 1 {
+				t.Errorf("want one job cgroup under %s, found %v (%v)", root, jobs, err)
 				return nil
 			}
-			jobDir := filepath.Join(root, entries[0].Name())
+			jobDir := jobs[0]
 			planted = filepath.Join(jobDir, "pin")
 			if err := os.Mkdir(planted, 0o755); err != nil {
 				t.Errorf("plant a child cgroup: %v", err)
