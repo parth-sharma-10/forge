@@ -81,6 +81,9 @@ another worker reclaims them.
   reclaims them. Shorter reclaims faster and heartbeats more often.
 - `-max-attempts` (3) is how many workers a job may kill before it is
   given up.
+- `-retain` (off) deletes finished jobs that long after they finish. Each
+  job row keeps up to a megabyte of log, so without it the table only grows.
+  `-retain 168h` keeps a week.
 
 ## Metrics
 
