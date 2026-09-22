@@ -158,3 +158,26 @@ none of it runs on macOS:
    write-heavy build's openat count stays small while the test process itself
    makes thousands, which is the proof the filter counts the job and not the
    machine.
+
+### What the histogram can and cannot see
+
+Two properties that are easy to assume the wrong way round. Both are pinned by
+`TestADeniedSyscallIsNotCounted` on a real kernel.
+
+**A syscall the seccomp filter denies is not counted.** The kernel runs the
+filter before the `sys_enter` tracepoint, and a denied call returns without
+reaching it. In CI, a job that tried `mount` 201 times (every attempt got
+`ENOSYS`) and a job that never tried both counted **exactly 11** mounts. Those
+11 came from Forge itself; the attempts were not counted at all. So the
+histogram is the *allowed* surface a build actually used. It is not a record
+of what the build tried and was refused, and it cannot be used to detect a
+build probing the filter. That would need `SECCOMP_RET_TRACE` or a
+`seccomp_unotify` listener, and the trade-offs of each are in the table at the
+top.
+
+**Forge's own sandbox setup is counted.** The re-executed child builds the
+sandbox inside the job's cgroup, before the filter exists: its private
+remount, scratch tmpfs, overlay, `/proc`, the `/dev` tmpfs and six device
+binds are the 11 mounts above, and `pivot_root` shows up too. Every job
+carries this fixed baseline. Subtract a no-op job's histogram to see what the
+build alone did.
