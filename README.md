@@ -229,7 +229,10 @@ table and what each one rising means.
 Add `-syscall-metrics` and each job's syscalls are counted through an eBPF
 `raw_tracepoint`, attributed to the job by its cgroup, and exported as
 `forge_job_syscalls_total{nr=...}` — which of the allowed syscalls builds
-actually reach for. It runs outside the sandbox, adds nothing to what a build
+actually reach for. A syscall the seccomp filter denies never reaches that
+tracepoint. It is counted at `sys_exit` instead, as
+`forge_job_syscalls_enosys_total{nr=...}`, which is where a build probing the
+filter shows up. It runs outside the sandbox, adds nothing to what a build
 can do, needs `CAP_BPF`, and logs one line and stays off where it cannot load.
 [docs/observability-ebpf.md](docs/observability-ebpf.md) has the design and
 what was built.

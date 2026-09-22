@@ -175,6 +175,7 @@ func TestADeniedSyscallIsCountedOnlyAsENOSYS(t *testing.T) {
 	if loud[mount] != quiet[mount] {
 		t.Fatalf("mount counted %d with %d denied attempts and %d with none: denied calls reached the tracepoint", loud[mount], tries, quiet[mount])
 	}
+	t.Logf("ENOSYS for mount: %d with %d attempts, %d with none", loud[mount|enosysTag], tries, quiet[mount|enosysTag])
 	if obs.exitLink == nil {
 		t.Fatal("the sys_exit ENOSYS counter did not attach")
 	}
