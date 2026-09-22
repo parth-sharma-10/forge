@@ -93,6 +93,7 @@ Both binaries speak the Prometheus text format; scrape them.
 | | `forge_jobs_done_total{outcome}` | `ok`, `failed`, `oom`, `killed`, `setup`, `given_up` |
 | | `forge_lease_lost_total` | heartbeats refused: a job this worker held was reclaimed |
 | | `forge_jobs_running` | jobs in hand now |
+| | `forge_sandbox_cleanup_failures_total` | job cgroups that could not be removed: each is a leaked kernel object, and any rise needs looking at |
 
 `forge_lease_lost_total` rising on a healthy worker means `-lease` is
 shorter than a heartbeat can reliably be delivered — a database or network
