@@ -2,6 +2,7 @@
 // follow its log. Standard library only.
 //
 //	POST /jobs            {"args": ["/bin/sh", "-c", "make"]}  -> 201 {"id": 7}
+//	GET  /jobs?state=running&limit=50&before=7                 -> 200 {"jobs": [...], "next": 3}, newest first
 //	GET  /jobs/{id}                                            -> 200 job JSON, 404
 //	GET  /jobs/{id}/logs                                       -> 200 text/plain, streamed until the job is done
 //	POST /jobs/{id}/cancel                                     -> 200 done, 202 running (killed within a heartbeat), 404, 409 already done
@@ -36,7 +37,15 @@ type Store interface {
 	Get(ctx context.Context, id int64) (queue.Status, error)
 	Counts(ctx context.Context) (map[string]int64, error)
 	Cancel(ctx context.Context, id int64) (string, error)
+	List(ctx context.Context, state string, before int64, limit int) ([]queue.Summary, error)
 }
+
+// Listing bounds: a page is defaultPage jobs unless the caller asks for up to
+// maxPage. No log is listed, so a page is small either way.
+const (
+	defaultPage = 50
+	maxPage     = 500
+)
 
 // followEvery is how often a followed log re-reads the row. The worker
 // flushes every two seconds at most, so reading faster than this buys
@@ -59,6 +68,7 @@ type server struct {
 func (s *server) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /jobs", s.submit)
+	mux.HandleFunc("GET /jobs", s.list)
 	mux.HandleFunc("GET /jobs/{id}", s.get)
 	mux.HandleFunc("GET /jobs/{id}/logs", s.logs)
 	mux.HandleFunc("POST /jobs/{id}/cancel", s.cancel)
@@ -103,10 +113,13 @@ func (s *server) authenticated(next http.Handler) http.Handler {
 
 // Job is the wire form of a job's state.
 type Job struct {
-	ID      int64  `json:"id"`
-	State   string `json:"state"`
-	Attempt int    `json:"attempt"`
-	Worker  string `json:"worker,omitempty"`
+	ID int64 `json:"id"`
+	// Args is the command; set in a listing, where it is what tells the jobs
+	// apart.
+	Args    []string `json:"args,omitempty"`
+	State   string   `json:"state"`
+	Attempt int      `json:"attempt"`
+	Worker  string   `json:"worker,omitempty"`
 	// ExitCode is present once the job is done: the command's status, or
 	// -1 if it was killed or never ran.
 	ExitCode  *int   `json:"exit_code,omitempty"`
@@ -146,13 +159,63 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	writeJSON(w, http.StatusOK, wireJob(id, st))
+}
+
+func wireJob(id int64, st queue.Status) Job {
 	j := Job{ID: id, State: st.State, Attempt: st.Attempt, Worker: st.Worker, Cancelled: st.Cancelled,
 		OOMKilled: st.Result.OOMKilled, Error: st.Result.Error, LogBytes: st.Result.Log.Total}
 	if st.State == "done" {
 		code := st.Result.ExitCode
 		j.ExitCode = &code
 	}
-	writeJSON(w, http.StatusOK, j)
+	return j
+}
+
+// list pages through the jobs newest first. next, when present, is the
+// before= that fetches the following page.
+func (s *server) list(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	state := q.Get("state")
+	switch state {
+	case "", "queued", "running", "done":
+	default:
+		http.Error(w, "state must be queued, running or done", http.StatusBadRequest)
+		return
+	}
+	limit, before := defaultPage, int64(0)
+	var err error
+	if v := q.Get("limit"); v != "" {
+		if limit, err = strconv.Atoi(v); err != nil || limit < 1 || limit > maxPage {
+			http.Error(w, fmt.Sprintf("limit must be 1 to %d", maxPage), http.StatusBadRequest)
+			return
+		}
+	}
+	if v := q.Get("before"); v != "" {
+		if before, err = strconv.ParseInt(v, 10, 64); err != nil || before < 1 {
+			http.Error(w, "before must be a job id", http.StatusBadRequest)
+			return
+		}
+	}
+	jobs, err := s.store.List(r.Context(), state, before, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	page := struct {
+		Jobs []Job `json:"jobs"`
+		Next int64 `json:"next,omitempty"`
+	}{Jobs: make([]Job, 0, len(jobs))}
+	for _, j := range jobs {
+		wj := wireJob(j.ID, j.Status)
+		wj.Args = j.Args
+		page.Jobs = append(page.Jobs, wj)
+	}
+	// A full page may have more behind it; a short one is the end.
+	if len(jobs) == limit {
+		page.Next = jobs[len(jobs)-1].ID
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 // logs writes the job's output and, while the job runs, keeps writing as
