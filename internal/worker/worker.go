@@ -188,6 +188,20 @@ func (w *Worker) loop(ctx context.Context, stop <-chan struct{}) {
 // finds out it cannot.
 func (w *Worker) run(ctx context.Context, job queue.Job) {
 	w.claimed.Inc()
+	// Cancelled while an earlier attempt ran, whose worker died before it
+	// noticed: finish it without running it again. Checked before the attempt
+	// cap, so a cancelled job is reported cancelled however often it was
+	// reclaimed.
+	if job.Cancelled {
+		r := queue.Result{ExitCode: -1, Error: queue.ReasonCancelled}
+		if err := w.Store.Report(ctx, job, r); err != nil {
+			w.Log.Warn("report failed", "job", job.ID, "err", err)
+		}
+		w.done["cancelled"].Inc()
+		w.Log.Info("job cancelled before it ran again", "job", job.ID)
+		return
+	}
+
 	// Enforced here rather than in the claim query: a job the query refused
 	// to hand out would sit running with an expired lease, a row nothing
 	// touches again. Handed out and reported, it is done, and says why.
@@ -200,18 +214,6 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		w.Log.Warn("job given up", "job", job.ID, "attempt", job.Attempt)
 		return
 	}
-	// Cancelled while an earlier attempt ran, whose worker died before it
-	// noticed: finish it without running it again.
-	if job.Cancelled {
-		r := queue.Result{ExitCode: -1, Error: queue.ReasonCancelled}
-		if err := w.Store.Report(ctx, job, r); err != nil {
-			w.Log.Warn("report failed", "job", job.ID, "err", err)
-		}
-		w.done["cancelled"].Inc()
-		w.Log.Info("job cancelled before it ran again", "job", job.ID)
-		return
-	}
-
 	w.running.Inc()
 	buildCtx, cancelBuild := context.WithCancel(ctx)
 	if w.Timeout > 0 {
