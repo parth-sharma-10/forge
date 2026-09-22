@@ -264,10 +264,10 @@ QUEUE_MUTATIONS = [
     (
         "heartbeat-without-fence",
         QUEUE,
-        "\t\tUPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5\n"
-        "\t\tWHERE id = $1 AND fence = $2 AND state = 'running'\n",
-        "\t\tUPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5\n"
-        "\t\tWHERE id = $1 AND $2::bigint >= 0 AND state = 'running'\n",
+        "\t\tWHERE id = $1 AND fence = $2 AND state = 'running'\n"
+        "\t\tRETURNING cancel_requested`,",
+        "\t\tWHERE id = $1 AND $2::bigint >= 0 AND state = 'running'\n"
+        "\t\tRETURNING cancel_requested`,",
     ),
     # The heartbeat never passes a cancel on: a cancelled build runs to the end.
     (
@@ -275,6 +275,22 @@ QUEUE_MUTATIONS = [
         QUEUE,
         "\t\tRETURNING cancel_requested`,",
         "\t\tRETURNING false`,",
+    ),
+    # Every heartbeat rewrites the log, changed or not: 1.15 MB of WAL a beat.
+    (
+        "heartbeat-rewrites-log",
+        QUEUE,
+        "\t\t    log = CASE WHEN log_bytes = $5 THEN log ELSE COALESCE($4, ''::bytea) END,\n",
+        "\t\t    log = COALESCE($4, ''::bytea),\n",
+    ),
+    # A reclaim keeps the dead attempt's log, so a new attempt whose output
+    # is the same length never replaces it.
+    (
+        "claim-keeps-old-log",
+        QUEUE,
+        "\t\t    worker = $1, lease_until = now() + $2, started_at = now(),\n"
+        "\t\t    log = '', log_bytes = 0\n",
+        "\t\t    worker = $1, lease_until = now() + $2, started_at = now()\n",
     ),
     # Cancel reaches a finished job and rewrites the result it already has.
     (

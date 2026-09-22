@@ -170,7 +170,8 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 	err := q.db.QueryRow(ctx, `
 		UPDATE jobs
 		SET state = 'running', attempt = attempt + 1, fence = fence + 1,
-		    worker = $1, lease_until = now() + $2, started_at = now()
+		    worker = $1, lease_until = now() + $2, started_at = now(),
+		    log = '', log_bytes = 0
 		WHERE id = (
 			SELECT id FROM jobs
 			WHERE state = 'queued' OR (state = 'running' AND lease_until < now())
@@ -197,6 +198,11 @@ type Log struct {
 }
 
 // Heartbeat extends the lease by lease from now and stores the log so far.
+// A log whose Total has not moved since the last heartbeat is not written
+// again, and its Tail may be nil: within one attempt the output is a single
+// append-only stream, so an unchanged count is an unchanged log. Claim starts
+// every attempt from an empty log, which is what keeps that true across one.
+// Rewriting an unchanged 1 MiB tail cost 1.15 MB of WAL a heartbeat.
 // ErrLeaseLost means the job was reclaimed: the worker should kill the
 // build. ErrCancelled means someone cancelled it: the worker should kill the
 // build and report it, which the lease it still holds lets it do.
@@ -207,7 +213,9 @@ type Log struct {
 func (q *Queue) Heartbeat(ctx context.Context, job Job, lease time.Duration, log Log) error {
 	var cancelled bool
 	err := q.db.QueryRow(ctx, `
-		UPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5
+		UPDATE jobs SET lease_until = now() + $3,
+		    log = CASE WHEN log_bytes = $5 THEN log ELSE COALESCE($4, ''::bytea) END,
+		    log_bytes = $5
 		WHERE id = $1 AND fence = $2 AND state = 'running'
 		RETURNING cancel_requested`,
 		job.ID, job.Fence, lease, log.Tail, log.Total).Scan(&cancelled)
