@@ -183,8 +183,11 @@ filter shows up. In CI, the job that tried `mount` 201 times counted at least
 200 mount ENOSYS returns, and the job that never tried counted none
 (`TestADeniedSyscallIsCountedOnlyAsENOSYS`). It uses a tracepoint rather than
 a raw tracepoint because the record already holds the decoded syscall number,
-so no per-architecture `pt_regs` offset is read. If it fails to attach, it
-logs one line and the histogram is unaffected.
+so no per-architecture `pt_regs` offset is read. The same counts came out on
+both architectures: amd64 in CI, and arm64 in the development VM (kernel
+6.8.0-100, where `mount` is nr 40 rather than 165). That was the first run of
+either program on arm64. If it fails to attach, it logs one line and the
+histogram is unaffected.
 
 **Forge's own sandbox setup is counted.** The re-executed child builds the
 sandbox inside the job's cgroup, before the filter exists: its private
