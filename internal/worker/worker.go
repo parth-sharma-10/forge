@@ -82,7 +82,7 @@ type Worker struct {
 }
 
 // outcomes are the labels of forge_jobs_done_total.
-var outcomes = []string{"ok", "failed", "oom", "killed", "setup", "given_up", "timeout"}
+var outcomes = []string{"ok", "failed", "oom", "killed", "setup", "given_up", "timeout", "cancelled"}
 
 const (
 	defaultLease       = 30 * time.Second
@@ -200,6 +200,17 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		w.Log.Warn("job given up", "job", job.ID, "attempt", job.Attempt)
 		return
 	}
+	// Cancelled while an earlier attempt ran, whose worker died before it
+	// noticed: finish it without running it again.
+	if job.Cancelled {
+		r := queue.Result{ExitCode: -1, Error: queue.ReasonCancelled}
+		if err := w.Store.Report(ctx, job, r); err != nil {
+			w.Log.Warn("report failed", "job", job.ID, "err", err)
+		}
+		w.done["cancelled"].Inc()
+		w.Log.Info("job cancelled before it ran again", "job", job.ID)
+		return
+	}
 
 	w.running.Inc()
 	buildCtx, cancelBuild := context.WithCancel(ctx)
@@ -209,6 +220,8 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 	defer cancelBuild()
 
 	log := &tail{limit: w.LogLimit}
+	// Set by the heartbeat before it closes heartbeatDone, read only after.
+	var cancelled bool
 	heartbeatDone := make(chan struct{})
 	go func() {
 		defer close(heartbeatDone)
@@ -220,7 +233,14 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 				return
 			case <-t.C:
 			}
-			if err := w.Store.Heartbeat(ctx, job, w.Lease, log.Log()); err != nil {
+			err := w.Store.Heartbeat(ctx, job, w.Lease, log.Log())
+			if errors.Is(err, queue.ErrCancelled) {
+				w.Log.Info("job cancelled, killing the build", "job", job.ID)
+				cancelled = true
+				cancelBuild()
+				return
+			}
+			if err != nil {
 				if errors.Is(err, queue.ErrLeaseLost) {
 					w.leaseLost.Inc()
 				}
@@ -260,6 +280,11 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		if r.Error == "" {
 			r.Error = fmt.Sprintf("timed out after %s", w.Timeout)
 		}
+	}
+	// Only a build the cancel actually killed is reported cancelled; one that
+	// exited on its own in the same heartbeat interval keeps its own result.
+	if cancelled && r.ExitCode == -1 && !r.OOMKilled {
+		out, r.Error = "cancelled", queue.ReasonCancelled
 	}
 	w.done[out].Inc()
 	if err := w.Store.Report(ctx, job, r); err != nil {

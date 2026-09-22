@@ -22,6 +22,7 @@ type fakeStore struct {
 	mu       sync.Mutex
 	jobs     []queue.Job
 	lostAt   int // heartbeats before the lease is reported lost; 0 = never
+	cancelAt int // heartbeats before the job is reported cancelled; 0 = never
 	beats    int
 	flushed  []queue.Log // the log carried by each heartbeat
 	reports  []queue.Result
@@ -54,6 +55,9 @@ func (s *fakeStore) Heartbeat(_ context.Context, _ queue.Job, _ time.Duration, l
 	s.flushed = append(s.flushed, log)
 	if s.lostAt != 0 && s.beats >= s.lostAt {
 		return queue.ErrLeaseLost
+	}
+	if s.cancelAt != 0 && s.beats >= s.cancelAt {
+		return queue.ErrCancelled
 	}
 	return nil
 }
@@ -284,5 +288,75 @@ func TestMetricsCountTheWork(t *testing.T) {
 		if !strings.Contains(got, line) {
 			t.Errorf("metrics missing %q:\n%s", line, got)
 		}
+	}
+}
+
+// TestACancelledJobIsKilledAndReportedCancelled: the heartbeat says cancelled,
+// the build is killed, and the report says why rather than "killed".
+func TestACancelledJobIsKilledAndReportedCancelled(t *testing.T) {
+	store := newStore([]string{"slow"})
+	store.cancelAt = 2
+	var reg metrics.Registry
+	w := &Worker{Store: store, Lease: 60 * time.Millisecond, Poll: 10 * time.Millisecond, Metrics: &reg,
+		Run: func(ctx context.Context, _ sandbox.Spec) error {
+			// What the sandbox returns for a build whose context was cancelled:
+			// PID 1 killed, so a signal and no exit status.
+			<-ctx.Done()
+			cmd := exec.Command("sleep", "10")
+			cmd.Start()
+			cmd.Process.Kill()
+			return cmd.Wait()
+		}}
+	serve(t, w)
+
+	r := store.waitReport(t)
+	if r.ExitCode != -1 || r.Error != queue.ReasonCancelled {
+		t.Fatalf("reported %+v, want exit -1 and error %q", r, queue.ReasonCancelled)
+	}
+	var b strings.Builder
+	reg.WriteTo(&b)
+	for _, line := range []string{
+		"forge_jobs_done_total{outcome=\"cancelled\"} 1\n",
+		"forge_jobs_done_total{outcome=\"killed\"} 0\n",
+		"forge_lease_lost_total 0\n",
+	} {
+		if !strings.Contains(b.String(), line) {
+			t.Errorf("metrics missing %q:\n%s", line, b.String())
+		}
+	}
+}
+
+// TestABuildThatFinishesAsItIsCancelledKeepsItsResult: a cancel noticed after
+// the build already exited on its own must not overwrite what it did.
+func TestABuildThatFinishesAsItIsCancelledKeepsItsResult(t *testing.T) {
+	store := newStore([]string{"done"})
+	store.cancelAt = 1
+	w := &Worker{Store: store, Lease: 60 * time.Millisecond, Poll: 10 * time.Millisecond,
+		Run: func(ctx context.Context, _ sandbox.Spec) error {
+			<-ctx.Done()
+			return exitWith(5)
+		}}
+	serve(t, w)
+
+	if r := store.waitReport(t); r.ExitCode != 5 || r.Error != "" {
+		t.Fatalf("reported %+v, want the build's own exit 5", r)
+	}
+}
+
+// TestAJobClaimedAlreadyCancelledIsNotRun: its earlier worker died before
+// noticing the cancel; this one reports it without starting the build.
+func TestAJobClaimedAlreadyCancelledIsNotRun(t *testing.T) {
+	store := newStore([]string{"never"})
+	store.jobs[0].Cancelled = true
+	ran := false
+	w := &Worker{Store: store, Lease: time.Second, Poll: 10 * time.Millisecond,
+		Run: func(context.Context, sandbox.Spec) error {
+			ran = true
+			return nil
+		}}
+	serve(t, w)
+
+	if r := store.waitReport(t); r.ExitCode != -1 || r.Error != queue.ReasonCancelled || ran {
+		t.Fatalf("reported %+v (ran: %v), want cancelled without running", r, ran)
 	}
 }

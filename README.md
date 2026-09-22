@@ -199,6 +199,11 @@ that is told how many bytes, rather than shown a splice. The API trusts its
 network — there is no authentication — and is meant to sit behind whatever
 provides it.
 
+`POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
+running job it answers `202`, and the worker's next heartbeat, at most two
+seconds later, kills the build and reports it `cancelled`. A job that has
+already finished answers `409`, and its result is kept.
+
 Every claim hands out a fencing token, and every heartbeat and report names
 it. A worker whose lease expired — paused, partitioned, or just slow — still
 holds its copy of the job, and can even finish the build; the queue refuses

@@ -51,6 +51,11 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sleeper, err := q.Submit(ctx, []string{"/bin/sh", "-c", "echo started; sleep 1000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	w := &Worker{
 		Store: q, Name: "e2e", Rootfs: rootfs, CgroupRoot: cgroupRoot,
 		Limits: cgroup.Limits{MemoryBytes: 32 << 20, MaxPIDs: 64},
@@ -100,6 +105,32 @@ func TestEndToEnd(t *testing.T) {
 	s = wait(hog)
 	if !s.Result.OOMKilled || s.Result.ExitCode != -1 || s.Result.Error != "" {
 		t.Errorf("memory hog result: %+v, want OOMKilled with exit -1 and no error", s.Result)
+	}
+
+	// Cancellation: the build is running when the cancel lands, and the
+	// worker's next heartbeat — every 666ms at this lease — kills it.
+	for deadline := time.Now().Add(60 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		s, err := q.Get(ctx, sleeper)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.State == "running" && s.Result.Log.Total > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the sleeper never started: %+v", s)
+		}
+	}
+	cancelledAt := time.Now()
+	if state, err := q.Cancel(ctx, sleeper); err != nil || state != "running" {
+		t.Fatalf("cancel of the running sleeper = %q, %v", state, err)
+	}
+	s = wait(sleeper)
+	if took := time.Since(cancelledAt); took > 10*time.Second {
+		t.Errorf("the cancelled build took %v to stop, want about one heartbeat", took)
+	}
+	if !s.Cancelled || s.Result.ExitCode != -1 || s.Result.Error != queue.ReasonCancelled {
+		t.Errorf("cancelled sleeper: %+v, want cancelled with exit -1", s)
 	}
 
 	close(stop)

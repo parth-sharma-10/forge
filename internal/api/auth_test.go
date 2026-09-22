@@ -83,6 +83,11 @@ func TestAuthGuardsEveryRoute(t *testing.T) {
 			t.Errorf("GET %s without a token: got %d, want 401", path, resp.StatusCode)
 		}
 	}
+	resp := do(t, "POST", srv.URL+"/jobs/1/cancel", "", "")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("POST /jobs/1/cancel without a token: got %d, want 401", resp.StatusCode)
+	}
 }
 
 // TestNoTokenDisablesAuth: the proxy-terminates-auth mode passes requests
