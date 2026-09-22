@@ -272,12 +272,12 @@ func TestCancel(t *testing.T) {
 	}
 
 	_, body := get(t, srv.URL+"/jobs/1")
-	if !strings.Contains(body, `"state":"done"`) || !strings.Contains(body, `"cancelled":true`) ||
+	if !strings.Contains(body, `"state":"done"`) || !strings.Contains(body, `"cancel_requested":true`) ||
 		!strings.Contains(body, `"error":"cancelled"`) {
 		t.Errorf("a cancelled queued job reads %s", body)
 	}
 	_, body = get(t, srv.URL+"/jobs/2")
-	if !strings.Contains(body, `"state":"running"`) || !strings.Contains(body, `"cancelled":true`) {
+	if !strings.Contains(body, `"state":"running"`) || !strings.Contains(body, `"cancel_requested":true`) {
 		t.Errorf("a cancelled running job reads %s", body)
 	}
 }
