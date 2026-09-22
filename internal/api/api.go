@@ -125,9 +125,11 @@ type Job struct {
 	ExitCode  *int   `json:"exit_code,omitempty"`
 	OOMKilled bool   `json:"oom_killed"`
 	Error     string `json:"error,omitempty"`
-	// Cancelled is set once the job has been cancelled; a running job
-	// stays running until its worker's next heartbeat kills it.
-	Cancelled bool `json:"cancelled,omitempty"`
+	// CancelRequested is set once a cancel has been asked for. A running job
+	// stays running until its worker's next heartbeat kills it, and one whose
+	// build exited on its own in that interval keeps its own exit status, so
+	// this says what was asked, not how the job ended; Error says that.
+	CancelRequested bool `json:"cancel_requested,omitempty"`
 	// LogBytes is how much output the job has produced so far — more than
 	// /logs returns if the worker's tail limit was passed.
 	LogBytes int64 `json:"log_bytes"`
@@ -163,7 +165,7 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 }
 
 func wireJob(id int64, st queue.Status) Job {
-	j := Job{ID: id, State: st.State, Attempt: st.Attempt, Worker: st.Worker, Cancelled: st.Cancelled,
+	j := Job{ID: id, State: st.State, Attempt: st.Attempt, Worker: st.Worker, CancelRequested: st.Cancelled,
 		OOMKilled: st.Result.OOMKilled, Error: st.Result.Error, LogBytes: st.Result.Log.Total}
 	if st.State == "done" {
 		code := st.Result.ExitCode
