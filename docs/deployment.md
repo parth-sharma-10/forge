@@ -94,7 +94,7 @@ Both binaries speak the Prometheus text format; scrape them.
 |---|---|---|
 | API `/metrics` | `forge_queue_jobs{state}` | jobs queued, running, done — the depth |
 | worker `-metrics addr` | `forge_jobs_claimed_total` | claims this worker made |
-| | `forge_jobs_done_total{outcome}` | `ok`, `failed`, `oom`, `killed`, `setup`, `given_up` |
+| | `forge_jobs_done_total{outcome}` | `ok`, `failed`, `oom`, `killed`, `setup`, `given_up`, `timeout` |
 | | `forge_lease_lost_total` | heartbeats refused: a job this worker held was reclaimed |
 | | `forge_jobs_running` | jobs in hand now |
 
