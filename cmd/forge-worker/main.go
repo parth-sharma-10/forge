@@ -66,6 +66,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer q.Close()
+	if *retain > 0 {
+		go prune(ctx, q, *retain, log)
+	}
 
 	stop := make(chan struct{})
 	sigs := make(chan os.Signal, 2)
@@ -108,9 +111,6 @@ func main() {
 			w.Observe = obs.Job()
 			log.Info("syscall metrics on")
 		}
-	}
-	if *retain > 0 {
-		go prune(ctx, q, *retain, log)
 	}
 	log.Info("worker started", "name", *name, "workers", *workers, "rootfs", *rootfs)
 	w.Serve(ctx, stop, *workers)
