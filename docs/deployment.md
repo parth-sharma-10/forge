@@ -29,8 +29,9 @@ sudo ROOTFS=/var/lib/forge/rootfs make rootfs
 every file's owner into the sandbox's uid map — uid 0 in the image becomes
 524288 on the host. The shift is what lets the per-job overlay copy files
 up; an image unpacked by hand needs `sudo hack/shift-rootfs.sh <path>` once.
-The worker refuses nothing here, but every build on an unshifted image
-fails its first write with `EOVERFLOW`.
+An unshifted image builds a sandbox without complaint, and every build on
+it then fails its first write with `EOVERFLOW`. The worker's startup
+preflight checks for this and refuses to start with an unshifted image.
 
 Any image will do, not only Alpine: unpack it, shift it, point `-rootfs`
 at it. Whatever the jobs run has to already be in it — the sandbox has no
