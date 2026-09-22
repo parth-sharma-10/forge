@@ -15,8 +15,9 @@ decision that is the owner's, exactly as the queue's PostgreSQL driver was
 Make each job's syscall behaviour observable — a per-job histogram of which
 syscalls a build made, and how often — exported through the metrics the worker
 already serves. This turns "the filter allows 192 syscalls" from a static claim
-into a running measurement: which of those 192 a real build actually uses, and
-whether anything is reaching for the edge of the allowlist.
+into a running measurement: which of those 192 a real build actually uses.
+(Not what it tried and was refused: a denied syscall never reaches the
+tracepoint. See [What the histogram can and cannot see](#what-the-histogram-can-and-cannot-see).)
 
 It must not weaken the sandbox. Observation is read-only, runs **outside** the
 sandbox in the worker, and never gives the build a new capability, syscall,
