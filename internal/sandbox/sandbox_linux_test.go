@@ -711,6 +711,48 @@ func TestCgroupIsRemovedAfterAnOOMKill(t *testing.T) {
 	}
 }
 
+// TestACgroupThatCannotBeRemovedIsReported: a job cgroup that survives its
+// build is a kernel object leaked, and Run used to drop the error that said so.
+// A child cgroup planted inside the job's makes rmdir fail with EBUSY, which is
+// what a leak looks like from here; Run must say so while still returning the
+// build's own result, which here is success.
+func TestACgroupThatCannotBeRemovedIsReported(t *testing.T) {
+	root := testCgroupRoot(t)
+	var planted string
+	err := Run(context.Background(), Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Args:       []string{"/bin/true"},
+		Observe: func(uint64) func() {
+			entries, err := os.ReadDir(root)
+			if err != nil || len(entries) == 0 {
+				t.Errorf("no job cgroup under %s: %v", root, err)
+				return nil
+			}
+			jobDir := filepath.Join(root, entries[0].Name())
+			planted = filepath.Join(jobDir, "pin")
+			if err := os.Mkdir(planted, 0o755); err != nil {
+				t.Errorf("plant a child cgroup: %v", err)
+			}
+			t.Cleanup(func() {
+				os.Remove(planted)
+				os.Remove(jobDir)
+			})
+			return nil
+		},
+	})
+	var cleanup *CleanupError
+	if !errors.As(err, &cleanup) {
+		t.Fatalf("err = %v, want a *CleanupError for the cgroup that could not be removed", err)
+	}
+	if cleanup.Build != nil {
+		t.Fatalf("the build succeeded, but CleanupError.Build = %v", cleanup.Build)
+	}
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("cleanup error = %v, want EBUSY from the planted child", cleanup.Cleanup)
+	}
+}
+
 func TestInvalidLimitsAreRejectedBeforeAnythingRuns(t *testing.T) {
 	err := Run(context.Background(), Spec{
 		Rootfs: t.TempDir(),

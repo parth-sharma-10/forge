@@ -70,7 +70,10 @@ const sandboxPATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bi
 // Cancelling ctx kills the child, which is PID 1 of the sandbox's PID
 // namespace — the kernel then kills everything else in that namespace, so a
 // build cannot outlive its context by forking away.
-func Run(ctx context.Context, spec Spec) error {
+//
+// A cgroup that cannot be removed after the build comes back as a
+// *CleanupError wrapping the build's own result.
+func Run(ctx context.Context, spec Spec) (err error) {
 	if err := spec.validate(); err != nil {
 		return err
 	}
@@ -79,7 +82,11 @@ func Run(ctx context.Context, spec Spec) error {
 	if err != nil {
 		return err
 	}
-	defer group.Close()
+	defer func() {
+		if closeErr := group.Close(); closeErr != nil {
+			err = &CleanupError{Build: err, Cleanup: closeErr}
+		}
+	}()
 
 	// Enrol the job for syscall observation, if a caller asked for it, before
 	// the build starts, and drain it after the build exits and before the
