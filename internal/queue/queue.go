@@ -52,9 +52,9 @@ const ReasonCancelled = "cancelled"
 // after it first existed (log_bytes in Phase 3, cancel_requested in v2),
 // each idempotent.
 //
-// ponytail: no attempt cap. A job that kills its worker every time is
-// reclaimed forever; Phase 4 owns the ceiling, with the runs history it
-// will want to decide it.
+// There is no attempt cap in the queue: the worker enforces -max-attempts
+// when it is handed a job past it (worker.run), so the row is finished and
+// says why rather than left unclaimable.
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
 	id          bigserial PRIMARY KEY,
