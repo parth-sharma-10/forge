@@ -19,11 +19,14 @@ layer by every job on the host. A build cannot modify it (that is deliberate
 and tested), but a malicious *image* is outside the model — it would be the
 operator attacking themselves.
 
-**The API's callers are not the adversary being modelled here.** `POST /jobs`
-has no authentication (`internal/api/api.go`, and
-[deployment.md](deployment.md) says so): anyone who can reach the listener can
-run a build. The listener belongs on loopback behind something that
-authenticates. The adversary modelled below starts *after* a job is accepted.
+**A caller holding the API token is trusted to submit builds.** Every route
+wants `Authorization: Bearer <token>`, compared in constant time, and
+`forge-api` will not start without a token unless the operator passes
+`-insecure-no-auth` for a proxy that authenticates in front
+(`internal/api/api.go`, `cmd/forge-api`). A caller *without* the token is
+refused; a caller with it can run any build, which is the point of the API. The
+adversary modelled below is the build itself, and it starts *after* a job is
+accepted.
 
 ### Assets, in the order losing them hurts
 
@@ -53,6 +56,9 @@ authenticates. The adversary modelled below starts *after* a job is accepted.
 | 13 | Have a stale result accepted | Fencing token per claim; `Heartbeat`/`Report` match only the live token | `internal/queue` | `TestAStaleFenceCannotReportOrHeartbeat`, `TestALateWorkersReportIsRefused`, `make mutate-queue` |
 | 14 | Inherit a host file descriptor across `execve` | Go opens its descriptors `O_CLOEXEC`; the raw `syscall.Exec` closes them, leaving only stdio | `sandbox_linux.go` | `TestNoHostDescriptorLeaksIntoTheBuild` (the CVE-2024-21626 class) |
 | 15 | Read the host's environment | The build is exec'd with a fixed two-variable environment (`PATH`, `HOME`); the worker's environment — where a registry token or DB password lives — is never forwarded | `sandbox_linux.go` | `TestTheBuildGetsACleanEnvironment` |
+| 16 | Learn where it sits in the host's cgroup tree | Cgroup namespace (`CLONE_NEWCGROUP`), created in the same clone that enters the job's cgroup, so its root is the job's cgroup | `sandbox_linux.go` | `TestSandboxRunsInsideItsOwnCgroup` (`/proc/self/cgroup` is `0::/`) |
+| 17 | Fill the disk, or exhaust inodes | The overlay's tmpfs is mounted with `size=` and `nr_inodes=` from `Spec.ScratchBytes` (`-disk-mb`): a fill gets `ENOSPC`, not an OOM kill | `sandbox_linux.go` | `TestTheDiskLimitStopsAHostileFill`, `TestTheInodeLimitStopsFileExhaustion` |
+| 18 | Hold a worker slot forever | Wall-clock deadline on the build's context (`-timeout`, 1h by default); expiry kills PID 1 and reports `timeout` | `internal/worker` | `TestAJobIsKilledWhenItTimesOut` |
 
 Two properties fall out of the shape rather than being coded for: a build
 cannot outlive its context by forking away, because killing PID 1 of a PID
@@ -115,18 +121,13 @@ Forge sets no CPU pinning, no core scheduling, no `spectre_v2` mitigations of
 its own, and does nothing about a build measuring another tenant through
 shared cache. Anything that must not co-reside should not co-reside.
 
-**Resource exhaustion outside the three capped dimensions.** Memory, CPU and
-PIDs are capped per job. Nothing caps file descriptors, inode consumption on
-the overlay's tmpfs beyond its size, dirty page writeback pressure, or the
-kernel memory a build can pin through legitimate allocations. The upper layer
-is a tmpfs with the kernel's default cap of half of RAM: a job with no
-`MemoryBytes` set can fill that much before `ENOSPC`. Set a memory limit.
-
-**No cgroup namespace.** `CLONE_NEWCGROUP` is not among the six
-(`sandbox_linux.go` says so in as many words). No `/sys` is mounted in the
-sandbox, so the host's cgroup paths are not reachable through the filesystem
-today — but this is a defence by absence of a mount, not by namespace, and it
-would stop being true the moment anything mounts `/sys`.
+**Resource exhaustion outside the capped dimensions.** Memory, CPU, PIDs,
+disk, inodes and wall-clock time are capped per job — the last three only when
+the operator sets `-disk-mb` and keeps `-timeout` non-zero. Nothing caps file
+descriptors beyond the rlimit the build inherits from the worker, dirty page
+writeback pressure, or the kernel memory a build can pin through legitimate
+allocations. Without `-disk-mb` the upper layer has the kernel's default tmpfs
+cap of half of RAM, and a job's memory limit is what stops it first.
 
 **Jobs share a uid range.** Every job on a worker maps to the same host uids.
 Since the overlay no two jobs share a writable filesystem, so what remains is
@@ -134,9 +135,13 @@ on the host's side: anything a job created outside its layer — nothing today �
 would belong to the same ids as every other job's. Per-job uid ranges are the
 fix if a later phase gives builds a way to write outside the layer.
 
-**The API is unauthenticated.** Repeated here because it is the easiest way to
-attack a Forge deployment and it is not a sandbox problem at all: reach the
-listener, run a build. Loopback plus a proxy that authenticates.
+**The API's authentication is one shared secret.** A static bearer token, not
+users or roles: anyone who holds it can submit, read and follow every job, and
+there is no revocation short of changing it and restarting `forge-api`. It
+travels in a header over plain HTTP, so off loopback it wants TLS in front.
+`-insecure-no-auth` turns the check off entirely, for a proxy that
+authenticates; run that way without one, reaching the listener is running a
+build.
 
 **At-least-once delivery.** A worker that dies between the build and the
 report leaves a job whose lease expires and which runs again. The attempt
@@ -164,7 +169,7 @@ not been reproduced against a running Forge.
 | `mknod` a block device for the host disk | classic privileged-container escape | Denied twice: the filter answers `mknod` `ENOSYS`, and a user namespace cannot create device nodes regardless. |
 | Abusing `CAP_SYS_ADMIN` to mount or `pivot_root` back out | privileged containers | `CAP_SYS_ADMIN` is not in the bounding set after `execve`, and `mount`/`pivot_root`/`chroot` are not on the allowlist. |
 | Creating a nested namespace to reset the boundary | `unshare`/`clone(CLONE_NEWUSER)` | `unshare` is not on the allowlist; `clone` with any `CLONE_NEW*` bit is `EPERM`; `clone3` is denied by number. |
-| Escaping via the cgroup filesystem | `release_agent` write | No `/sys` is mounted, and the build is not host root. |
+| Escaping via the cgroup filesystem | `release_agent` write | No `/sys` is mounted, the build is not host root, and the cgroup namespace roots any cgroupfs it could see at its own cgroup. |
 | Kernel LPE through an allowed syscall | many | **Not defended.** See above. |
 
 ## Review triggers

@@ -108,6 +108,14 @@ func main() {
 			log.Info("syscall metrics on")
 		}
 	}
+	// Build one sandbox before claiming anything: a worker that cannot would
+	// otherwise take every job in the queue and report each a setup failure.
+	if err := sandbox.Preflight(ctx, sandbox.Spec{
+		Rootfs: w.Rootfs, Limits: w.Limits, CgroupRoot: w.CgroupRoot, ScratchBytes: w.ScratchBytes,
+	}); err != nil {
+		log.Error("this host cannot run builds; refusing to claim jobs", "err", err)
+		os.Exit(1)
+	}
 	log.Info("worker started", "name", *name, "workers", *workers, "rootfs", *rootfs)
 	w.Serve(ctx, stop, *workers)
 	log.Info("worker exited cleanly")
