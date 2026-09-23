@@ -96,6 +96,10 @@ an attack. Forge does not currently distinguish the two, and there is no
 auditing of denials — `SECCOMP_RET_KILL_PROCESS` or a `seccomp_unotify`
 listener is a one-constant change in `denyAction` for an operator who wants
 denials loud, and that trade is recorded in `seccomp_linux.go`.
+The eBPF syscall histogram (`-syscall-metrics`) does not fill this gap. The
+filter runs before the tracepoint it counts from, so a denied call is never
+counted. That was measured, not argued: 201 denied `mount` calls added nothing
+([observability-ebpf.md](observability-ebpf.md)).
 
 ## What Forge does not defend against
 
