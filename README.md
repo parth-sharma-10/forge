@@ -27,7 +27,7 @@ make test          # gofmt check, go vet, go test -race — everywhere
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
 make mutate        # break the sandbox 27 ways and check a test notices each
-make mutate-queue  # break the queue 6 ways, on the host, against FORGE_TEST_DSN
+make mutate-queue  # break the queue 8 ways, on the host, against FORGE_TEST_DSN
 make fuzz          # fuzz the seccomp filter against its policy (Linux, Go, no root)
 make bench         # sandbox setup latency and jobs per second (Linux, root)
 make vm-bench      # the same, inside the colima VM

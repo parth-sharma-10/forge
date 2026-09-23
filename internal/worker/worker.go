@@ -230,13 +230,23 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		defer close(heartbeatDone)
 		t := time.NewTicker(w.heartbeatEvery())
 		defer t.Stop()
+		// What the last accepted heartbeat stored: an unchanged log is sent
+		// as its count alone, and the queue keeps what it has.
+		var stored int64
 		for {
 			select {
 			case <-buildCtx.Done():
 				return
 			case <-t.C:
 			}
-			err := w.Store.Heartbeat(ctx, job, w.Lease, log.Log())
+			l := log.Log()
+			if l.Total == stored {
+				l.Tail = nil
+			}
+			err := w.Store.Heartbeat(ctx, job, w.Lease, l)
+			if err == nil {
+				stored = l.Total
+			}
 			if errors.Is(err, queue.ErrCancelled) {
 				w.Log.Info("job cancelled, killing the build", "job", job.ID)
 				cancelled = true

@@ -741,3 +741,28 @@ without running. A build that exits on its own in the same interval as the
 cancel keeps its own exit status: only a build the cancel actually killed is
 reported `cancelled`. A finished job cannot be cancelled (`409`), and its
 result stands.
+
+## 2026-09-22 — A heartbeat writes the log only when it has grown
+
+**Measured first.** A heartbeat that re-sent an unchanged, incompressible
+1 MiB tail wrote **1,152,931 bytes of WAL**. Postgres re-TOASTs a bytea
+parameter even when it matches the stored value. A quiet build that has filled
+its tail heartbeats every two seconds, so that came to about 0.55 MB/s of WAL
+per job for no new output. After the change: **176 bytes** per heartbeat
+(`TestAnUnchangedLogIsNotRewritten` logs the number).
+
+**The rule.** The heartbeat keeps the stored log when `log_bytes` equals the
+count it is sent, so Postgres reuses the existing TOAST pointer. The worker
+also leaves the tail off in that case, which saves the network transfer. This
+depends on an invariant: within one attempt the output is one append-only
+stream, so an equal count means equal bytes. To keep that true across
+attempts, `Claim` now resets the log to empty. Otherwise a new attempt whose
+output happened to be exactly as long as the dead one's would never replace
+it (`TestAReclaimedJobDoesNotKeepTheDeadAttemptsLog`). The side effect is that
+a reclaimed job's old output disappears at the claim rather than at the new
+attempt's first heartbeat, which the follower already reports as a restart.
+
+Rejected: append-only log chunks in their own table. That removes the rewrite
+of a *growing* tail as well, but it adds a table, a join and a retention path.
+Revisit if a chatty build's rewrite of a changing tail shows up in a
+measurement.
