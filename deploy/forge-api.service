@@ -1,6 +1,6 @@
 # forge-api: the HTTP front door. Unprivileged; nowhere near the sandbox.
-# Set FORGE_DSN in /etc/forge/api.env; bind to loopback and put whatever
-# does authentication in front of it.
+# Set FORGE_DSN and FORGE_API_TOKEN in /etc/forge/api.env — without the token
+# forge-api refuses to start. Bind to loopback; TLS goes in front.
 [Unit]
 Description=Forge API
 After=network-online.target postgresql.service
