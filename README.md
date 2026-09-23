@@ -180,24 +180,32 @@ followed. `forge-api` is the front door: it needs no privileges and never
 touches the sandbox. The table is created by whichever connects first.
 
 ```
+$ export FORGE_API_TOKEN=$(openssl rand -hex 32)
 $ forge-api -dsn "$DSN" -listen 127.0.0.1:18080 &
 $ sudo forge-worker -dsn "$DSN" -rootfs /var/tmp/forge-rootfs -workers 2 -memory-mb 64 &
-$ curl -s -X POST 127.0.0.1:18080/jobs -d '{"args": ["/bin/sh", "-c", "for i in 1 2 3; do echo step $i; sleep 1; done; exit 3"]}'
+$ auth="Authorization: Bearer $FORGE_API_TOKEN"
+$ curl -s -H "$auth" -X POST 127.0.0.1:18080/jobs -d '{"args": ["/bin/sh", "-c", "for i in 1 2 3; do echo step $i; sleep 1; done; exit 3"]}'
 {"id":1}
-$ curl -sN 127.0.0.1:18080/jobs/1/logs        # streams; each line arrived a second apart
+$ curl -sN -H "$auth" 127.0.0.1:18080/jobs/1/logs        # streams; each line arrived a second apart
 step 1
 step 2
 step 3
-$ curl -s 127.0.0.1:18080/jobs/1
+$ curl -s -H "$auth" 127.0.0.1:18080/jobs/1
 {"id":1,"state":"done","attempt":1,"worker":"colima","exit_code":3,"oom_killed":false,"log_bytes":21}
 ```
 
 `GET /jobs/{id}/logs` follows a running job by re-reading its row every half
 second and writing what is new, and returns at once for a job that is done.
 The row holds the last megabyte of output; a follower that missed more than
-that is told how many bytes, rather than shown a splice. The API trusts its
-network — there is no authentication — and is meant to sit behind whatever
-provides it.
+that is told how many bytes, rather than shown a splice. Every route,
+`/metrics` included, wants `Authorization: Bearer <token>`, compared in
+constant time; `forge-api` refuses to start without a token unless told
+`-insecure-no-auth`, for a proxy that authenticates in front of it.
+
+`POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
+running job it answers `202`, and the worker's next heartbeat, at most two
+seconds later, kills the build and reports it `cancelled`. A job that has
+already finished answers `409`, and its result is kept.
 
 `POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
 running job it answers `202`, and the worker's next heartbeat, at most two
@@ -308,9 +316,11 @@ no two jobs share a writable filesystem, so what remains of that is on the
 host's side: everything any job creates outside its layer — nothing, today —
 would belong to the same ids.
 
-The overlay's upper layer is a tmpfs with the kernel's default size cap, half
-of RAM. A job with no memory limit can fill that much before writes fail with
-`ENOSPC`; a job with one hits the limit first.
+The overlay's upper layer is a tmpfs. `-disk-mb` caps it, bytes and inodes
+both, so a build that fills it gets `ENOSPC` rather than an OOM kill; without
+the flag it has the kernel's default cap, half of RAM, and a job's memory limit
+is what stops it first. `-timeout` (an hour by default) kills a build that runs
+past it and reports it as `timeout`.
 
 Nothing a build writes survives the job. Artifacts come out on stdout or not
 at all until a later phase gives the worker a way to collect them.
@@ -342,7 +352,8 @@ the report leaves a job whose lease expires and is run again; the row's
 attempt count says it happened, and nothing makes the second run unnecessary
 — idempotent jobs are the caller's business.
 
-The API has no authentication, no way to cancel or list jobs, and no
+The API's authentication is one shared bearer token, not users or roles. It
+has no way to cancel or list jobs, and no
 webhook — a webhook is a client of `POST /jobs` and can live anywhere.
 
 The benchmark numbers above are from one small VM. They are what the

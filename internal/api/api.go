@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/parth-sharma-10/forge/internal/metrics"
@@ -143,9 +144,18 @@ func (s *server) submit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "body must be JSON with an args array: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(body.Args) == 0 {
+	if len(body.Args) == 0 || body.Args[0] == "" {
 		http.Error(w, "args must name a command", http.StatusBadRequest)
 		return
+	}
+	// JSON can carry a NUL as \u0000, and neither PostgreSQL text nor an
+	// execve argument can hold one: refused here as the client's error rather
+	// than reaching the database as a 500 carrying its message.
+	for _, a := range body.Args {
+		if strings.IndexByte(a, 0) >= 0 {
+			http.Error(w, "args must not contain NUL bytes", http.StatusBadRequest)
+			return
+		}
 	}
 	id, err := s.store.Submit(r.Context(), body.Args)
 	if err != nil {

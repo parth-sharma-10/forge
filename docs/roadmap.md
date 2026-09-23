@@ -26,6 +26,7 @@ adds no product surface — it adds evidence.
 | Threat model + isolation tests | per-boundary control→code→test table; what Forge does *not* defend; fd-leak (CVE-2024-21626 class) and clean-environment tests | done — [threat-model.md](threat-model.md) (PR #18) |
 | runc CVE-2024-21626 repro | Forge-side non-vulnerability tested; upstream reproduction planned | Forge half done; upstream deferred — [cve-2024-21626.md](cve-2024-21626.md) (needs a disposable host) |
 | eBPF syscall observability | per-job syscall histograms, non-intrusive, degrading gracefully | done — [observability-ebpf.md](observability-ebpf.md) |
+| Hardening pass | bearer-token API auth (default deny), wall-clock job timeout, per-job disk + inode cap, cgroup namespace | done — [threat-model.md](threat-model.md) boundaries 16–18 (PR #20) |
 | GPU passthrough (v3) | GPU-capable sandbox, isolation trade-offs made explicit | analysed, deferred — [gpu-forge-v3.md](gpu-forge-v3.md) (needs hardware + an isolation decision) |
 
 ## Phase 2 — worker and queue
@@ -82,4 +83,5 @@ and benchmark numbers — jobs per second per worker, sandbox setup latency
 Named in [phase-1.md](phase-1.md): `/dev/ptmx` and `/dev/shm` when a build
 needs them; artifacts — nothing a build writes survives the job today, and
 the persistent upper layer Phase 1 rejected is where a later phase collects
-from; `Run` discarding `group.Close()`'s error.
+from. (`Run` discarding `group.Close()`'s error was fixed in v2: a cgroup
+left behind is now a `*CleanupError` and `forge_sandbox_cleanup_failures_total`.)

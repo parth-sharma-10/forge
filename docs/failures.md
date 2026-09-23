@@ -603,3 +603,29 @@ before and after.
 numbers in the README are from CI's runner for that reason, with the VM's
 given beside them as what a loaded machine looks like. If this failure
 recurs on a quiet machine it is a bug, and this entry is where it starts.
+
+## 2026-09-22 — Two packages' tests shared one database and truncated it under each other
+
+**Symptom.** Run locally with `FORGE_TEST_DSN` set, `go test -race ./internal/queue ./internal/worker`
+failed on every one of three runs on `main`. The worker failed with
+`queue: no such job` and `relation "jobs" does not exist`, and the queue
+package failed about half the time as well. Each package passed when run on
+its own.
+
+**Root cause.** `go test` runs packages in parallel. Both packages' test
+helpers `TRUNCATE jobs` against the same database, and
+`TestConcurrentOpensOnAFreshDatabase` drops the table. Whichever package
+reached that point first wiped the rows the other was in the middle of using.
+CI runs the same `make test` against one database and had been green, but
+only because the two packages happened not to overlap on a two-core runner.
+Nothing prevented the overlap.
+
+**Fix.** `queuetest.Exclusive`: every test that touches the database first
+takes a session-level advisory lock on a connection of its own, and holds it
+until the test's cleanup closes that connection. Tests serialise on the
+database, and the build stays parallel. After the fix: five parallel runs,
+five passes.
+
+**Lesson.** A test's isolation boundary is the state it shares, not its
+package. Test helpers that reset shared state need a lock that is as wide as
+the state they reset.
