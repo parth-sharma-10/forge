@@ -1191,3 +1191,34 @@ func TestADroppedCapabilityIsGone(t *testing.T) {
 		t.Fatalf("socket(AF_INET, SOCK_RAW) inside the sandbox: %q, want EPERM: the build still holds CAP_NET_RAW", out)
 	}
 }
+
+// TestPreflightPassesOnAWorkingHost builds a whole sandbox and runs nothing.
+func TestPreflightPassesOnAWorkingHost(t *testing.T) {
+	err := Preflight(context.Background(), Spec{
+		Rootfs: rootfs(t), CgroupRoot: testCgroupRoot(t), Limits: cgroup.Limits{MemoryBytes: 64 << 20},
+	})
+	if err != nil {
+		t.Fatalf("preflight on the test image: %v", err)
+	}
+}
+
+// TestPreflightRefusesAnUnshiftedImage: a job's setup builds a sandbox on an
+// image still owned by host root without complaint, and the build then fails
+// with EOVERFLOW at its first write to an image file. Preflight names it.
+func TestPreflightRefusesAnUnshiftedImage(t *testing.T) {
+	root := testCgroupRoot(t)
+	// Under /var/tmp (1777) and 0755, so the mapped uid can reach and read it:
+	// the only thing wrong with it is who owns it.
+	image, err := os.MkdirTemp("/var/tmp", "forge-unshifted-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(image) })
+	if err := os.Chmod(image, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err = Preflight(context.Background(), Spec{Rootfs: image, CgroupRoot: root})
+	if err == nil || !strings.Contains(err.Error(), "not shifted into the uid map") {
+		t.Fatalf("preflight on an image owned by host root = %v, want it named as unshifted", err)
+	}
+}

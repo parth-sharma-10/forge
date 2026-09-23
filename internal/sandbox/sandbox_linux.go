@@ -108,6 +108,9 @@ func Run(ctx context.Context, spec Spec) (err error) {
 		envHostname + "=" + spec.Hostname,
 		envScratch + "=" + strconv.FormatInt(spec.ScratchBytes, 10),
 	}
+	if spec.preflight {
+		cmd.Env = append(cmd.Env, envPreflight+"=1")
+	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = spec.Stdin, spec.Stdout, spec.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: namespaces,
@@ -155,6 +158,32 @@ func Run(ctx context.Context, spec Spec) (err error) {
 		}
 	}
 	return runErr
+}
+
+// Preflight builds the sandbox spec describes — its cgroup, the namespaces,
+// the overlay, /proc, /dev, pivot_root, the bounding set and the seccomp filter
+// — and exits in place of running anything, so it depends on nothing in the
+// image. spec.Args is ignored.
+//
+// A worker calls it once before claiming work. A host that cannot build a
+// sandbox — no cgroup delegation, no CAP_SYS_ADMIN, a masked /proc, a kernel
+// without CLONE_INTO_CGROUP, a binary the mapped uid cannot re-exec — then
+// fails at startup with the reason, rather than claiming job after job and
+// reporting each one as a setup failure until the queue is empty.
+//
+// It also checks one thing a job's setup does not: that the image is shifted
+// into the uid map. An unshifted image builds a sandbox without complaint and
+// fails later, at the first write to a file the image owns, as EOVERFLOW from
+// the overlay's copy-up — which reads as the build's fault, not the host's.
+func Preflight(ctx context.Context, spec Spec) error {
+	var stderr strings.Builder
+	spec.Args, spec.preflight = []string{"preflight"}, true
+	spec.Stdin, spec.Stdout, spec.Stderr = nil, nil, &stderr
+	spec.Observe = nil
+	if err := Run(ctx, spec); err != nil {
+		return fmt.Errorf("sandbox: preflight: %w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 // mountProc gives the sandbox the process table of its own PID namespace. It
@@ -430,6 +459,12 @@ func child() error {
 	if err := syscall.Mount("none", "/", "", syscall.MS_REC|syscall.MS_PRIVATE, ""); err != nil {
 		return fmt.Errorf("sandbox: make mounts private: %w", err)
 	}
+	preflight := os.Getenv(envPreflight) != ""
+	if preflight {
+		if err := checkShifted(rootfs); err != nil {
+			return err
+		}
+	}
 	// A parse error means the parent set it wrong, which is a bug, not a build
 	// error; zero (its zero value on ParseInt failure) is the no-cap default.
 	scratchBytes, _ := strconv.ParseInt(os.Getenv(envScratch), 10, 64)
@@ -470,9 +505,12 @@ func child() error {
 	if err := os.Setenv("PATH", sandboxPATH); err != nil {
 		return fmt.Errorf("sandbox: %w", err)
 	}
-	path, err := exec.LookPath(argv[0])
-	if err != nil {
-		return fmt.Errorf("sandbox: %w", err)
+	var path string
+	if !preflight {
+		var err error
+		if path, err = exec.LookPath(argv[0]); err != nil {
+			return fmt.Errorf("sandbox: %w", err)
+		}
 	}
 
 	if err := dropBoundingSet(); err != nil {
@@ -481,5 +519,26 @@ func child() error {
 	if err := applySeccomp(); err != nil {
 		return err
 	}
+	if preflight {
+		os.Exit(0)
+	}
 	return syscall.Exec(path, argv, []string{"PATH=" + sandboxPATH, "HOME=/root"})
+}
+
+// checkShifted confirms the image's root directory belongs to root of the
+// sandbox's user namespace. Read from inside it, before the overlay covers the
+// path: an image owned by a host uid the map covers shows as its uid in the
+// namespace, and one it does not — an image left owned by host root — shows as
+// the overflow uid.
+func checkShifted(rootfs string) error {
+	var st syscall.Stat_t
+	if err := syscall.Stat(rootfs, &st); err != nil {
+		return fmt.Errorf("sandbox: stat image %s: %w", rootfs, err)
+	}
+	if st.Uid != 0 {
+		return fmt.Errorf("sandbox: image %s is owned by uid %d inside the sandbox, not 0: "+
+			"it is not shifted into the uid map (run hack/shift-rootfs.sh), and builds would fail "+
+			"with EOVERFLOW at their first write to an image file", rootfs, st.Uid)
+	}
+	return nil
 }

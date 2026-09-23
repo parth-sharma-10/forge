@@ -29,8 +29,9 @@ sudo ROOTFS=/var/lib/forge/rootfs make rootfs
 every file's owner into the sandbox's uid map — uid 0 in the image becomes
 524288 on the host. The shift is what lets the per-job overlay copy files
 up; an image unpacked by hand needs `sudo hack/shift-rootfs.sh <path>` once.
-The worker refuses nothing here, but every build on an unshifted image
-fails its first write with `EOVERFLOW`.
+An unshifted image builds a sandbox without complaint, and every build on
+it then fails its first write with `EOVERFLOW`. The worker's startup
+preflight checks for this and refuses to start with an unshifted image.
 
 Any image will do, not only Alpine: unpack it, shift it, point `-rootfs`
 at it. Whatever the jobs run has to already be in it — the sandbox has no
@@ -70,6 +71,14 @@ subtree, `/sys/fs/cgroup/system.slice/forge-worker.service`.
 one shared secret over plain HTTP, so anything past loopback wants TLS in
 front; a proxy that authenticates on its own can run the API with
 `-insecure-no-auth` instead. Never on an interface a build can reach.
+
+**Starting.** Before it claims anything, the worker builds one complete
+sandbox and runs nothing in it. It also checks that the image is shifted into
+the uid map. If either fails, it exits 1 with the reason: missing delegation,
+a masked `/proc`, an unshifted image. The alternative is a worker that takes
+every job in the queue and reports each one as a setup failure. A unit that
+restart-loops on start is the preflight doing its job; `journalctl -u
+forge-worker` has the reason.
 
 **Stopping.** `systemctl stop forge-worker` sends `SIGTERM`, which drains:
 the jobs in hand finish, no more are claimed. `TimeoutStopSec=300` is how
