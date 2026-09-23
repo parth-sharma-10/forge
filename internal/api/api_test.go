@@ -118,7 +118,7 @@ func TestSubmitAndGet(t *testing.T) {
 
 func TestBadRequests(t *testing.T) {
 	srv, _ := newServer(t)
-	for _, body := range []string{`{}`, `{"args": []}`, `not json`, ``} {
+	for _, body := range []string{`{}`, `{"args": []}`, `not json`, ``, `{"args": [""]}`, `{"args": ["sh", "a\u0000b"]}`} {
 		if resp := post(t, srv.URL+"/jobs", body); resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("POST /jobs with %q: %d, want 400", body, resp.StatusCode)
 		}
