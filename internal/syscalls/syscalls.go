@@ -30,3 +30,10 @@ var ErrUnsupported = errors.New("syscalls: observability unsupported here")
 // since a portable number-to-name table is a maintenance burden the number
 // itself does not need.
 const MetricName = "forge_job_syscalls_total"
+
+// EnosysMetricName counts, by number, the syscalls builds made that returned
+// ENOSYS: denied by the seccomp filter, or not implemented by the kernel.
+// MetricName cannot see a denied call at all — the filter runs before the
+// sys_enter tracepoint — so this is the only place a build probing the filter
+// shows up.
+const EnosysMetricName = "forge_job_syscalls_enosys_total"
