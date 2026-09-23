@@ -207,6 +207,16 @@ running job it answers `202`, and the worker's next heartbeat, at most two
 seconds later, kills the build and reports it `cancelled`. A job that has
 already finished answers `409`, and its result is kept.
 
+`POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
+running job it answers `202`, and the worker's next heartbeat, at most two
+seconds later, kills the build and reports it `cancelled`. A job that has
+already finished answers `409`, and its result is kept.
+
+`GET /jobs` lists jobs newest first, without their logs. It takes an optional
+`state=` filter and a `limit=` (default 50, maximum 500), and pages with
+`before=<id>`, whose value the previous page returns as `next`. Paging by id
+means a job submitted between two pages doesn't shift the second one.
+
 Every claim hands out a fencing token, and every heartbeat and report names
 it. A worker whose lease expired — paused, partitioned, or just slow — still
 holds its copy of the job, and can even finish the build; the queue refuses
