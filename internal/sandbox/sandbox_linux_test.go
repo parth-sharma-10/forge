@@ -711,6 +711,50 @@ func TestCgroupIsRemovedAfterAnOOMKill(t *testing.T) {
 	}
 }
 
+// TestACgroupThatCannotBeRemovedIsReported: a job cgroup that survives its
+// build is a kernel object leaked, and Run used to drop the error that said so.
+// A child cgroup planted inside the job's makes rmdir fail with EBUSY, which is
+// what a leak looks like from here; Run must say so while still returning the
+// build's own result, which here is success.
+func TestACgroupThatCannotBeRemovedIsReported(t *testing.T) {
+	root := testCgroupRoot(t)
+	var planted string
+	err := Run(context.Background(), Spec{
+		Rootfs:     rootfs(t),
+		CgroupRoot: root,
+		Args:       []string{"/bin/true"},
+		Observe: func(uint64) func() {
+			// The root also holds the kernel's interface files; the job is
+			// the one directory named job-*.
+			jobs, err := filepath.Glob(filepath.Join(root, "job-*"))
+			if err != nil || len(jobs) != 1 {
+				t.Errorf("want one job cgroup under %s, found %v (%v)", root, jobs, err)
+				return nil
+			}
+			jobDir := jobs[0]
+			planted = filepath.Join(jobDir, "pin")
+			if err := os.Mkdir(planted, 0o755); err != nil {
+				t.Errorf("plant a child cgroup: %v", err)
+			}
+			t.Cleanup(func() {
+				os.Remove(planted)
+				os.Remove(jobDir)
+			})
+			return nil
+		},
+	})
+	var cleanup *CleanupError
+	if !errors.As(err, &cleanup) {
+		t.Fatalf("err = %v, want a *CleanupError for the cgroup that could not be removed", err)
+	}
+	if cleanup.Build != nil {
+		t.Fatalf("the build succeeded, but CleanupError.Build = %v", cleanup.Build)
+	}
+	if !errors.Is(err, syscall.EBUSY) {
+		t.Fatalf("cleanup error = %v, want EBUSY from the planted child", cleanup.Cleanup)
+	}
+}
+
 func TestInvalidLimitsAreRejectedBeforeAnythingRuns(t *testing.T) {
 	err := Run(context.Background(), Spec{
 		Rootfs: t.TempDir(),
@@ -1145,5 +1189,36 @@ func TestTheBoundingSetIsTheKeepList(t *testing.T) {
 func TestADroppedCapabilityIsGone(t *testing.T) {
 	if out := runProbe(t, "raw-socket"); out != "socket: operation not permitted" {
 		t.Fatalf("socket(AF_INET, SOCK_RAW) inside the sandbox: %q, want EPERM: the build still holds CAP_NET_RAW", out)
+	}
+}
+
+// TestPreflightPassesOnAWorkingHost builds a whole sandbox and runs nothing.
+func TestPreflightPassesOnAWorkingHost(t *testing.T) {
+	err := Preflight(context.Background(), Spec{
+		Rootfs: rootfs(t), CgroupRoot: testCgroupRoot(t), Limits: cgroup.Limits{MemoryBytes: 64 << 20},
+	})
+	if err != nil {
+		t.Fatalf("preflight on the test image: %v", err)
+	}
+}
+
+// TestPreflightRefusesAnUnshiftedImage: a job's setup builds a sandbox on an
+// image still owned by host root without complaint, and the build then fails
+// with EOVERFLOW at its first write to an image file. Preflight names it.
+func TestPreflightRefusesAnUnshiftedImage(t *testing.T) {
+	root := testCgroupRoot(t)
+	// Under /var/tmp (1777) and 0755, so the mapped uid can reach and read it:
+	// the only thing wrong with it is who owns it.
+	image, err := os.MkdirTemp("/var/tmp", "forge-unshifted-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(image) })
+	if err := os.Chmod(image, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	err = Preflight(context.Background(), Spec{Rootfs: image, CgroupRoot: root})
+	if err == nil || !strings.Contains(err.Error(), "not shifted into the uid map") {
+		t.Fatalf("preflight on an image owned by host root = %v, want it named as unshifted", err)
 	}
 }

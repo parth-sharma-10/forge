@@ -76,9 +76,9 @@ type Worker struct {
 	// PID 1, and the job is reported as timed out.
 	Timeout time.Duration
 
-	claimed, leaseLost *metrics.Counter
-	done               map[string]*metrics.Counter
-	running            *metrics.Gauge
+	claimed, leaseLost, cleanupFailed *metrics.Counter
+	done                              map[string]*metrics.Counter
+	running                           *metrics.Gauge
 }
 
 // outcomes are the labels of forge_jobs_done_total.
@@ -120,6 +120,7 @@ func (w *Worker) defaults() {
 	}
 	w.claimed = w.Metrics.Counter("forge_jobs_claimed_total", "Jobs claimed from the queue.", nil)
 	w.leaseLost = w.Metrics.Counter("forge_lease_lost_total", "Heartbeats refused: the job had been reclaimed.", nil)
+	w.cleanupFailed = w.Metrics.Counter("forge_sandbox_cleanup_failures_total", "Jobs whose cgroup could not be removed: one leaked per count.", nil)
 	w.running = w.Metrics.Gauge("forge_jobs_running", "Jobs in hand right now.", nil)
 	w.done = map[string]*metrics.Counter{}
 	for _, o := range outcomes {
@@ -275,6 +276,15 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 	})
 	cancelBuild()
 	<-heartbeatDone
+	// A cgroup the sandbox could not remove is the host's problem, not the
+	// build's: it is logged and counted for the operator, and the job is
+	// reported on what the build itself did.
+	var cleanup *sandbox.CleanupError
+	if errors.As(err, &cleanup) {
+		w.cleanupFailed.Inc()
+		w.Log.Error("sandbox cleanup failed, a cgroup is leaking", "job", job.ID, "err", cleanup.Cleanup)
+		err = cleanup.Build
+	}
 	// The build has exited: it is no longer in hand, whatever the report
 	// is about to say. Decremented here rather than deferred so a reader
 	// that sees the report sees the gauge already down.
