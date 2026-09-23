@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -21,15 +22,19 @@ import (
 type fakeStore struct {
 	mu   sync.Mutex
 	jobs map[int64]queue.Status
+	args map[int64][]string
 }
 
-func newStore() *fakeStore { return &fakeStore{jobs: map[int64]queue.Status{}} }
+func newStore() *fakeStore {
+	return &fakeStore{jobs: map[int64]queue.Status{}, args: map[int64][]string{}}
+}
 
 func (s *fakeStore) Submit(_ context.Context, args []string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	id := int64(len(s.jobs) + 1)
 	s.jobs[id] = queue.Status{State: "queued"}
+	s.args[id] = args
 	return id, nil
 }
 
@@ -68,6 +73,19 @@ func (s *fakeStore) Cancel(_ context.Context, id int64) (string, error) {
 	st.Cancelled = true
 	s.jobs[id] = st
 	return st.State, nil
+}
+
+func (s *fakeStore) List(_ context.Context, state string, before int64, limit int) ([]queue.Summary, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []queue.Summary
+	for id, st := range s.jobs {
+		if (state == "" || st.State == state) && (before == 0 || id < before) {
+			out = append(out, queue.Summary{ID: id, Args: s.args[id], Status: st})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
+	return out[:min(limit, len(out))], nil
 }
 
 // set is the worker's side: what a heartbeat or a report would have written.
@@ -279,5 +297,54 @@ func TestCancel(t *testing.T) {
 	_, body = get(t, srv.URL+"/jobs/2")
 	if !strings.Contains(body, `"state":"running"`) || !strings.Contains(body, `"cancel_requested":true`) {
 		t.Errorf("a cancelled running job reads %s", body)
+	}
+}
+
+func TestListPagesNewestFirst(t *testing.T) {
+	srv, store := newServer(t)
+	for _, cmd := range []string{"a", "b", "c"} {
+		post(t, srv.URL+"/jobs", `{"args": ["`+cmd+`"]}`)
+	}
+	store.set(1, queue.Status{State: "done", Result: queue.Result{ExitCode: 0}})
+
+	type page struct {
+		Jobs []Job
+		Next int64
+	}
+	read := func(path string) page {
+		t.Helper()
+		resp, body := get(t, srv.URL+path)
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("GET %s: %d %s", path, resp.StatusCode, body)
+		}
+		var p page
+		if err := json.Unmarshal([]byte(body), &p); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	p := read("/jobs?limit=2")
+	if len(p.Jobs) != 2 || p.Jobs[0].ID != 3 || p.Jobs[1].ID != 2 || p.Next != 2 || p.Jobs[0].Args[0] != "c" {
+		t.Fatalf("first page = %+v, want jobs 3, 2 with next 2", p)
+	}
+	p = read("/jobs?limit=2&before=2")
+	if len(p.Jobs) != 1 || p.Jobs[0].ID != 1 || p.Next != 0 || p.Jobs[0].ExitCode == nil {
+		t.Fatalf("last page = %+v, want job 1, done, with no next", p)
+	}
+	if p = read("/jobs?state=queued"); len(p.Jobs) != 2 {
+		t.Fatalf("queued = %+v, want 2", p)
+	}
+	if p = read("/jobs?state=running"); p.Jobs == nil || len(p.Jobs) != 0 {
+		t.Fatalf("running = %+v, want an empty list, not null", p)
+	}
+}
+
+func TestListRejectsBadQueries(t *testing.T) {
+	srv, _ := newServer(t)
+	for _, q := range []string{"state=lost", "limit=0", "limit=501", "limit=x", "before=0", "before=x"} {
+		if resp, _ := get(t, srv.URL+"/jobs?"+q); resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("GET /jobs?%s: %d, want 400", q, resp.StatusCode)
+		}
 	}
 }

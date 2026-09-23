@@ -163,7 +163,7 @@ none of it runs on macOS:
 ### What the histogram can and cannot see
 
 Two properties that are easy to assume the wrong way round. Both are pinned by
-`TestADeniedSyscallIsNotCounted` on a real kernel.
+`TestADeniedSyscallIsCountedOnlyAsENOSYS` on a real kernel.
 
 **A syscall the seccomp filter denies is not counted.** The kernel runs the
 filter before the `sys_enter` tracepoint, and a denied call returns without
@@ -171,10 +171,23 @@ reaching it. In CI, a job that tried `mount` 201 times (every attempt got
 `ENOSYS`) and a job that never tried both counted **exactly 11** mounts. Those
 11 came from Forge itself; the attempts were not counted at all. So the
 histogram is the *allowed* surface a build actually used. It is not a record
-of what the build tried and was refused, and it cannot be used to detect a
-build probing the filter. That would need `SECCOMP_RET_TRACE` or a
-`seccomp_unotify` listener, and the trade-offs of each are in the table at the
-top.
+of what the build tried and was refused.
+
+**A denied syscall is counted at `sys_exit`, as ENOSYS.** The exit tracepoint
+still fires for a call the filter skipped, carrying the filter's `-ENOSYS`. A
+second program, on `raw_syscalls:sys_exit`, counts per job only the calls that
+returned ENOSYS, into `forge_job_syscalls_enosys_total{nr}`. That means denied
+by the filter or not implemented by the kernel; for a build, both mean it
+asked for something it could not have. This is where a build probing the
+filter shows up. In CI, the job that tried `mount` 201 times counted at least
+200 mount ENOSYS returns, and the job that never tried counted none
+(`TestADeniedSyscallIsCountedOnlyAsENOSYS`). It uses a tracepoint rather than
+a raw tracepoint because the record already holds the decoded syscall number,
+so no per-architecture `pt_regs` offset is read. The same counts came out on
+both architectures: amd64 in CI, and arm64 in the development VM (kernel
+6.8.0-100, where `mount` is nr 40 rather than 165). That was the first run of
+either program on arm64. If it fails to attach, it logs one line and the
+histogram is unaffected.
 
 **Forge's own sandbox setup is counted.** The re-executed child builds the
 sandbox inside the job's cgroup, before the filter exists: its private

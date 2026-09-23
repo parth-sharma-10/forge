@@ -353,3 +353,41 @@ func (q *Queue) Get(ctx context.Context, id int64) (Status, error) {
 	}
 	return s, nil
 }
+
+// Summary is one job in a listing: its command and its state, without the log.
+type Summary struct {
+	ID   int64
+	Args []string
+	Status
+}
+
+// List returns up to limit jobs, newest first, with ids below before (zero for
+// the newest) and in state (empty for any). Paging is by id rather than by
+// offset, so a job submitted between two pages does not shift the second one.
+func (q *Queue) List(ctx context.Context, state string, before int64, limit int) ([]Summary, error) {
+	rows, err := q.db.Query(ctx, `
+		SELECT id, args, state, attempt, worker, cancel_requested, exit_code, oom_killed, error, log_bytes
+		FROM jobs
+		WHERE ($1 = '' OR state = $1) AND ($2 = 0 OR id < $2)
+		ORDER BY id DESC
+		LIMIT $3`, state, before, limit)
+	if err != nil {
+		return nil, fmt.Errorf("queue: list: %w", err)
+	}
+	defer rows.Close()
+	var out []Summary
+	for rows.Next() {
+		var j Summary
+		var exit *int
+		if err := rows.Scan(&j.ID, &j.Args, &j.State, &j.Attempt, &j.Worker, &j.Cancelled, &exit,
+			&j.Result.OOMKilled, &j.Result.Error, &j.Result.Log.Total); err != nil {
+			return nil, fmt.Errorf("queue: list: %w", err)
+		}
+		j.Result.ExitCode = -1
+		if exit != nil {
+			j.Result.ExitCode = *exit
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}

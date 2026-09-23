@@ -212,6 +212,11 @@ running job it answers `202`, and the worker's next heartbeat, at most two
 seconds later, kills the build and reports it `cancelled`. A job that has
 already finished answers `409`, and its result is kept.
 
+`GET /jobs` lists jobs newest first, without their logs. It takes an optional
+`state=` filter and a `limit=` (default 50, maximum 500), and pages with
+`before=<id>`, whose value the previous page returns as `next`. Paging by id
+means a job submitted between two pages doesn't shift the second one.
+
 Every claim hands out a fencing token, and every heartbeat and report names
 it. A worker whose lease expired — paused, partitioned, or just slow — still
 holds its copy of the job, and can even finish the build; the queue refuses
@@ -242,7 +247,10 @@ table and what each one rising means.
 Add `-syscall-metrics` and each job's syscalls are counted through an eBPF
 `raw_tracepoint`, attributed to the job by its cgroup, and exported as
 `forge_job_syscalls_total{nr=...}` — which of the allowed syscalls builds
-actually reach for. It runs outside the sandbox, adds nothing to what a build
+actually reach for. A syscall the seccomp filter denies never reaches that
+tracepoint. It is counted at `sys_exit` instead, as
+`forge_job_syscalls_enosys_total{nr=...}`, which is where a build probing the
+filter shows up. It runs outside the sandbox, adds nothing to what a build
 can do, needs `CAP_BPF`, and logs one line and stays off where it cannot load.
 [docs/observability-ebpf.md](docs/observability-ebpf.md) has the design and
 what was built.
