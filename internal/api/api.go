@@ -4,6 +4,7 @@
 //	POST /jobs            {"args": ["/bin/sh", "-c", "make"]}  -> 201 {"id": 7}
 //	GET  /jobs/{id}                                            -> 200 job JSON, 404
 //	GET  /jobs/{id}/logs                                       -> 200 text/plain, streamed until the job is done
+//	POST /jobs/{id}/cancel                                     -> 200 done, 202 running (killed within a heartbeat), 404, 409 already done
 //	GET  /metrics                                              -> the queue's depth by state, Prometheus text format
 //
 // Authentication is a static bearer token, applied to every route including
@@ -35,6 +36,7 @@ type Store interface {
 	Submit(ctx context.Context, args []string) (int64, error)
 	Get(ctx context.Context, id int64) (queue.Status, error)
 	Counts(ctx context.Context) (map[string]int64, error)
+	Cancel(ctx context.Context, id int64) (string, error)
 }
 
 // followEvery is how often a followed log re-reads the row. The worker
@@ -60,6 +62,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("POST /jobs", s.submit)
 	mux.HandleFunc("GET /jobs/{id}", s.get)
 	mux.HandleFunc("GET /jobs/{id}/logs", s.logs)
+	mux.HandleFunc("POST /jobs/{id}/cancel", s.cancel)
 	var reg metrics.Registry
 	reg.Sampled("forge_queue_jobs", "Jobs in the queue, by state.", func() ([]metrics.Sample, error) {
 		counts, err := s.store.Counts(context.Background())
@@ -110,6 +113,11 @@ type Job struct {
 	ExitCode  *int   `json:"exit_code,omitempty"`
 	OOMKilled bool   `json:"oom_killed"`
 	Error     string `json:"error,omitempty"`
+	// CancelRequested is set once a cancel has been asked for. A running job
+	// stays running until its worker's next heartbeat kills it, and one whose
+	// build exited on its own in that interval keeps its own exit status, so
+	// this says what was asked, not how the job ended; Error says that.
+	CancelRequested bool `json:"cancel_requested,omitempty"`
 	// LogBytes is how much output the job has produced so far — more than
 	// /logs returns if the worker's tail limit was passed.
 	LogBytes int64 `json:"log_bytes"`
@@ -150,7 +158,7 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	j := Job{ID: id, State: st.State, Attempt: st.Attempt, Worker: st.Worker,
+	j := Job{ID: id, State: st.State, Attempt: st.Attempt, Worker: st.Worker, CancelRequested: st.Cancelled,
 		OOMKilled: st.Result.OOMKilled, Error: st.Result.Error, LogBytes: st.Result.Log.Total}
 	if st.State == "done" {
 		code := st.Result.ExitCode
@@ -203,6 +211,31 @@ func (s *server) logs(w http.ResponseWriter, r *http.Request) {
 		if st, err = s.store.Get(r.Context(), id); err != nil {
 			return
 		}
+	}
+}
+
+// cancel cancels a job. A queued job is finished on the spot (200); a running
+// one is marked and killed by its worker at the next heartbeat (202, since the
+// build may still be running when the response arrives). A finished job's
+// result stands (409).
+func (s *server) cancel(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		http.Error(w, "job id must be a number", http.StatusBadRequest)
+		return
+	}
+	state, err := s.store.Cancel(r.Context(), id)
+	switch {
+	case errors.Is(err, queue.ErrNotFound):
+		http.Error(w, "no such job", http.StatusNotFound)
+	case errors.Is(err, queue.ErrDone):
+		http.Error(w, "job already done", http.StatusConflict)
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	case state == "done":
+		writeJSON(w, http.StatusOK, map[string]any{"id": id, "state": state})
+	default:
+		writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "state": state})
 	}
 }
 

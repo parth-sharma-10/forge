@@ -31,17 +31,30 @@ var ErrEmpty = errors.New("queue: nothing to claim")
 // build, not to retry.
 var ErrLeaseLost = errors.New("queue: lease lost")
 
-// ErrNotFound is returned by Get for an id that was never submitted.
+// ErrNotFound is returned by Get and Cancel for an id that was never
+// submitted.
 var ErrNotFound = errors.New("queue: no such job")
 
+// ErrCancelled is returned by Heartbeat when the job has been cancelled: the
+// worker should kill the build and report it. Unlike ErrLeaseLost the job is
+// still this worker's, and its report is accepted.
+var ErrCancelled = errors.New("queue: job cancelled")
+
+// ErrDone is returned by Cancel for a job that has already finished.
+var ErrDone = errors.New("queue: job already done")
+
+// ReasonCancelled is the error a cancelled job is finished with, by Cancel
+// for a queued job or by the worker for a running one.
+const ReasonCancelled = "cancelled"
+
 // schema is applied by Open. CREATE IF NOT EXISTS rather than a migration
-// tool: there is one table. The ALTER at the end is the one column added
-// after the table first existed (Phase 3); a second one is when a
-// migration tool earns its place.
+// tool: there is one table, and the ALTERs at the end are the columns added
+// after it first existed (log_bytes in Phase 3, cancel_requested in v2),
+// each idempotent.
 //
-// ponytail: no attempt cap. A job that kills its worker every time is
-// reclaimed forever; Phase 4 owns the ceiling, with the runs history it
-// will want to decide it.
+// There is no attempt cap in the queue: the worker enforces -max-attempts
+// when it is handed a job past it (worker.run), so the row is finished and
+// says why rather than left unclaimable.
 const schema = `
 CREATE TABLE IF NOT EXISTS jobs (
 	id          bigserial PRIMARY KEY,
@@ -62,6 +75,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs (id) WHERE state <> 'done';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS log_bytes bigint NOT NULL DEFAULT 0;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
 `
 
 // Queue is a handle on the jobs table. It is safe for concurrent use.
@@ -136,6 +150,10 @@ type Job struct {
 	Fence      int64
 	Attempt    int
 	LeaseUntil time.Time
+	// Cancelled means the job was cancelled while an earlier attempt ran and
+	// that worker died before reporting it. The claimer reports it cancelled
+	// rather than running it.
+	Cancelled bool
 }
 
 // Claim takes the oldest job that is queued or whose lease has expired,
@@ -159,8 +177,8 @@ func (q *Queue) Claim(ctx context.Context, worker string, lease time.Duration) (
 			ORDER BY id
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1)
-		RETURNING id, args, fence, attempt, lease_until`,
-		worker, lease).Scan(&j.ID, &j.Args, &j.Fence, &j.Attempt, &j.LeaseUntil)
+		RETURNING id, args, fence, attempt, lease_until, cancel_requested`,
+		worker, lease).Scan(&j.ID, &j.Args, &j.Fence, &j.Attempt, &j.LeaseUntil, &j.Cancelled)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, ErrEmpty
 	}
@@ -180,19 +198,61 @@ type Log struct {
 
 // Heartbeat extends the lease by lease from now and stores the log so far.
 // ErrLeaseLost means the job was reclaimed: the worker should kill the
-// build.
+// build. ErrCancelled means someone cancelled it: the worker should kill the
+// build and report it, which the lease it still holds lets it do.
+//
+// Cancellation rides the heartbeat rather than a channel of its own, so it
+// reaches a running build within one heartbeat interval and needs nothing
+// listening on the worker.
 func (q *Queue) Heartbeat(ctx context.Context, job Job, lease time.Duration, log Log) error {
-	tag, err := q.db.Exec(ctx, `
+	var cancelled bool
+	err := q.db.QueryRow(ctx, `
 		UPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5
-		WHERE id = $1 AND fence = $2 AND state = 'running'`,
-		job.ID, job.Fence, lease, log.Tail, log.Total)
+		WHERE id = $1 AND fence = $2 AND state = 'running'
+		RETURNING cancel_requested`,
+		job.ID, job.Fence, lease, log.Tail, log.Total).Scan(&cancelled)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrLeaseLost
+	}
 	if err != nil {
 		return fmt.Errorf("queue: heartbeat: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return ErrLeaseLost
+	if cancelled {
+		return ErrCancelled
 	}
 	return nil
+}
+
+// Cancel cancels a job and returns the state it is left in. A queued job is
+// finished on the spot — no worker ever sees it — and comes back "done". A
+// running one is marked, and comes back "running": its worker learns at its
+// next heartbeat, kills the build and reports it, so it is done within one
+// heartbeat interval of the call. ErrDone for a job that already finished,
+// whose result stands; ErrNotFound for one that never existed.
+//
+// One statement, so a claim racing it either took the row first — the cancel
+// then waits on the row lock and finds it running — or finds it done.
+func (q *Queue) Cancel(ctx context.Context, id int64) (string, error) {
+	var state string
+	err := q.db.QueryRow(ctx, `
+		UPDATE jobs
+		SET cancel_requested = true,
+		    state       = CASE WHEN state = 'queued' THEN 'done' ELSE state END,
+		    exit_code   = CASE WHEN state = 'queued' THEN -1 ELSE exit_code END,
+		    error       = CASE WHEN state = 'queued' THEN $2 ELSE error END,
+		    finished_at = CASE WHEN state = 'queued' THEN now() ELSE finished_at END
+		WHERE id = $1 AND state <> 'done'
+		RETURNING state`, id, ReasonCancelled).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		if _, getErr := q.Get(ctx, id); getErr != nil {
+			return "", getErr
+		}
+		return "", ErrDone
+	}
+	if err != nil {
+		return "", fmt.Errorf("queue: cancel: %w", err)
+	}
+	return state, nil
 }
 
 // Result is what a worker reports when the build has exited.
@@ -256,6 +316,9 @@ type Status struct {
 	State   string // queued, running or done
 	Attempt int
 	Worker  string
+	// Cancelled is set once Cancel has been called; a running job stays
+	// running until its worker notices.
+	Cancelled bool
 	// Result is complete once State is done. While the job runs, Result.Log
 	// is what the worker has flushed so far.
 	Result Result
@@ -266,9 +329,9 @@ func (q *Queue) Get(ctx context.Context, id int64) (Status, error) {
 	var s Status
 	var exit *int
 	err := q.db.QueryRow(ctx, `
-		SELECT state, attempt, worker, exit_code, oom_killed, error, log, log_bytes
+		SELECT state, attempt, worker, cancel_requested, exit_code, oom_killed, error, log, log_bytes
 		FROM jobs WHERE id = $1`, id).
-		Scan(&s.State, &s.Attempt, &s.Worker, &exit, &s.Result.OOMKilled, &s.Result.Error,
+		Scan(&s.State, &s.Attempt, &s.Worker, &s.Cancelled, &exit, &s.Result.OOMKilled, &s.Result.Error,
 			&s.Result.Log.Tail, &s.Result.Log.Total)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Status{}, ErrNotFound

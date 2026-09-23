@@ -53,6 +53,23 @@ func (s *fakeStore) Counts(context.Context) (map[string]int64, error) {
 	return counts, nil
 }
 
+func (s *fakeStore) Cancel(_ context.Context, id int64) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.jobs[id]
+	switch {
+	case !ok:
+		return "", queue.ErrNotFound
+	case st.State == "done":
+		return "", queue.ErrDone
+	case st.State == "queued":
+		st.State, st.Result.ExitCode, st.Result.Error = "done", -1, queue.ReasonCancelled
+	}
+	st.Cancelled = true
+	s.jobs[id] = st
+	return st.State, nil
+}
+
 // set is the worker's side: what a heartbeat or a report would have written.
 func (s *fakeStore) set(id int64, st queue.Status) {
 	s.mu.Lock()
@@ -224,5 +241,43 @@ func TestMetricsCountTheQueue(t *testing.T) {
 	want := "forge_queue_jobs{state=\"queued\"} 1\nforge_queue_jobs{state=\"running\"} 1\nforge_queue_jobs{state=\"done\"} 0\n"
 	if !strings.Contains(body, want) {
 		t.Fatalf("metrics =\n%s\nwant to contain\n%s", body, want)
+	}
+}
+
+// TestCancel: a queued job is finished at once (200), a running one is marked
+// for its worker (202), a done one is left alone (409), an unknown one is 404.
+func TestCancel(t *testing.T) {
+	srv, store := newServer(t)
+	post(t, srv.URL+"/jobs", `{"args": ["true"]}`)
+	post(t, srv.URL+"/jobs", `{"args": ["true"]}`)
+	post(t, srv.URL+"/jobs", `{"args": ["true"]}`)
+	store.set(2, queue.Status{State: "running", Attempt: 1})
+	store.set(3, queue.Status{State: "done", Attempt: 1})
+
+	for _, c := range []struct {
+		path string
+		want int
+	}{
+		{"/jobs/1/cancel", http.StatusOK},
+		{"/jobs/2/cancel", http.StatusAccepted},
+		{"/jobs/3/cancel", http.StatusConflict},
+		{"/jobs/42/cancel", http.StatusNotFound},
+		{"/jobs/abc/cancel", http.StatusBadRequest},
+	} {
+		resp := post(t, srv.URL+c.path, "")
+		resp.Body.Close()
+		if resp.StatusCode != c.want {
+			t.Errorf("POST %s: %d, want %d", c.path, resp.StatusCode, c.want)
+		}
+	}
+
+	_, body := get(t, srv.URL+"/jobs/1")
+	if !strings.Contains(body, `"state":"done"`) || !strings.Contains(body, `"cancel_requested":true`) ||
+		!strings.Contains(body, `"error":"cancelled"`) {
+		t.Errorf("a cancelled queued job reads %s", body)
+	}
+	_, body = get(t, srv.URL+"/jobs/2")
+	if !strings.Contains(body, `"state":"running"`) || !strings.Contains(body, `"cancel_requested":true`) {
+		t.Errorf("a cancelled running job reads %s", body)
 	}
 }

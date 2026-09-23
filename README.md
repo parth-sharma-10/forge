@@ -27,7 +27,7 @@ make test          # gofmt check, go vet, go test -race — everywhere
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside the colima VM
 make mutate        # break the sandbox 27 ways and check a test notices each
-make mutate-queue  # break the queue 4 ways, on the host, against FORGE_TEST_DSN
+make mutate-queue  # break the queue 6 ways, on the host, against FORGE_TEST_DSN
 make fuzz          # fuzz the seccomp filter against its policy (Linux, Go, no root)
 make bench         # sandbox setup latency and jobs per second (Linux, root)
 make vm-bench      # the same, inside the colima VM
@@ -201,6 +201,11 @@ that is told how many bytes, rather than shown a splice. Every route,
 `/metrics` included, wants `Authorization: Bearer <token>`, compared in
 constant time; `forge-api` refuses to start without a token unless told
 `-insecure-no-auth`, for a proxy that authenticates in front of it.
+
+`POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
+running job it answers `202`, and the worker's next heartbeat, at most two
+seconds later, kills the build and reports it `cancelled`. A job that has
+already finished answers `409`, and its result is kept.
 
 Every claim hands out a fencing token, and every heartbeat and report names
 it. A worker whose lease expired — paused, partitioned, or just slow — still

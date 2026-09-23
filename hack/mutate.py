@@ -265,9 +265,23 @@ QUEUE_MUTATIONS = [
         "heartbeat-without-fence",
         QUEUE,
         "\t\tUPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5\n"
-        "\t\tWHERE id = $1 AND fence = $2 AND state = 'running'`,",
+        "\t\tWHERE id = $1 AND fence = $2 AND state = 'running'\n",
         "\t\tUPDATE jobs SET lease_until = now() + $3, log = COALESCE($4, ''::bytea), log_bytes = $5\n"
-        "\t\tWHERE id = $1 AND $2::bigint >= 0 AND state = 'running'`,",
+        "\t\tWHERE id = $1 AND $2::bigint >= 0 AND state = 'running'\n",
+    ),
+    # The heartbeat never passes a cancel on: a cancelled build runs to the end.
+    (
+        "cancel-not-heard",
+        QUEUE,
+        "\t\tRETURNING cancel_requested`,",
+        "\t\tRETURNING false`,",
+    ),
+    # Cancel reaches a finished job and rewrites the result it already has.
+    (
+        "cancel-overwrites-done",
+        QUEUE,
+        "\t\tWHERE id = $1 AND state <> 'done'\n",
+        "\t\tWHERE id = $1\n",
     ),
     # An expired lease is never reclaimed: a dead worker's job is stuck.
     (

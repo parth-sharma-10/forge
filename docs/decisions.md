@@ -720,3 +720,24 @@ operator asks for names in the exposition rather than at read time.
 The feature is behind `-syscall-metrics` (default off) and degrades to a
 logged line on any host that cannot load it, so the common deployment carries
 none of it.
+
+## 2026-09-22 — Cancellation rides the heartbeat
+
+**`POST /jobs/{id}/cancel` sets a flag on the row; the worker learns of it
+from its next heartbeat.** A queued job is finished on the spot, in the same
+statement, and no worker ever sees it. A running one stays `running` until
+its worker's heartbeat returns `ErrCancelled`. The worker then kills the build
+exactly as a timeout would and reports it, with a fence that is still valid.
+The latency is one heartbeat interval: `min(lease/3, 2s)`.
+
+Rejected: a push channel to the worker (`LISTEN/NOTIFY`, or a worker-side
+listener). It would be faster, but it is a second path that can fail
+separately from the lease. The heartbeat already carries the log up and the
+lease-lost signal down, and cancellation is one more bit on that round trip.
+
+Two edges are handled in code and each has its own test. A job cancelled while
+its worker was dead is reclaimed with `Job.Cancelled` set and is reported
+without running. A build that exits on its own in the same interval as the
+cancel keeps its own exit status: only a build the cancel actually killed is
+reported `cancelled`. A finished job cannot be cancelled (`409`), and its
+result stands.
