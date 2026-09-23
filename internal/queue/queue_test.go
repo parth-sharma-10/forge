@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/parth-sharma-10/forge/internal/queue/queuetest"
 )
 
 const dsnEnv = "FORGE_TEST_DSN"
@@ -25,6 +27,7 @@ func open(t *testing.T) *Queue {
 		}
 		t.Skipf("%s not set: e.g. postgres://forge@127.0.0.1:5432/postgres", dsnEnv)
 	}
+	queuetest.Exclusive(t, dsn)
 	q, err := Open(context.Background(), dsn)
 	if err != nil {
 		t.Fatal(err)
@@ -154,15 +157,20 @@ func TestClaimIsExclusive(t *testing.T) {
 func TestAnExpiredLeaseIsReclaimed(t *testing.T) {
 	q, ctx := open(t), context.Background()
 	id, _ := q.Submit(ctx, []string{"true"})
-	first, err := q.Claim(ctx, "w1", 50*time.Millisecond)
+	// The live-lease claim below must land inside the lease: at 50ms a -race
+	// build on a two-core runner can miss it, as TestHeartbeatExtendsTheLease
+	// did. The job it gets, if any, is named, so a failure says whether the
+	// lease ran out (this job) or another package's row leaked in (not this job).
+	const lease = 500 * time.Millisecond
+	first, err := q.Claim(ctx, "w1", lease)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.Claim(ctx, "w2", time.Minute); !errors.Is(err, ErrEmpty) {
-		t.Fatalf("claim while the lease is live: %v, want ErrEmpty", err)
+	if got, err := q.Claim(ctx, "w2", time.Minute); !errors.Is(err, ErrEmpty) {
+		t.Fatalf("claim while the lease is live: got job %d (args %q), %v; want ErrEmpty", got.ID, got.Args, err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(lease + 200*time.Millisecond)
 	second, err := q.Claim(ctx, "w2", time.Minute)
 	if err != nil {
 		t.Fatalf("claim after the lease expired: %v", err)
@@ -212,14 +220,17 @@ func TestAStaleFenceCannotReportOrHeartbeat(t *testing.T) {
 func TestHeartbeatExtendsTheLease(t *testing.T) {
 	q, ctx := open(t), context.Background()
 	q.Submit(ctx, []string{"true"})
-	job, _ := q.Claim(ctx, "w1", 100*time.Millisecond)
+	// Margins sized for a -race build on a two-core runner: at 100ms a lease
+	// with 40ms to spare expired there between the last heartbeat and the claim.
+	const lease = 500 * time.Millisecond
+	job, _ := q.Claim(ctx, "w1", lease)
 	for i := 0; i < 3; i++ {
-		time.Sleep(60 * time.Millisecond)
-		if err := q.Heartbeat(ctx, job, 100*time.Millisecond, Log{}); err != nil {
+		time.Sleep(lease * 6 / 10)
+		if err := q.Heartbeat(ctx, job, lease, Log{}); err != nil {
 			t.Fatalf("heartbeat %d: %v", i, err)
 		}
 	}
-	// 180ms in, well past the original 100ms lease.
+	// 900ms in, well past the original 500ms lease.
 	if _, err := q.Claim(ctx, "w2", time.Minute); !errors.Is(err, ErrEmpty) {
 		t.Fatalf("claim while the heartbeats kept the lease: %v, want ErrEmpty", err)
 	}
