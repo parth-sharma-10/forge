@@ -43,6 +43,27 @@ var ErrUnsupported = errors.New("sandbox: requires Linux")
 // error still unwraps to *exec.ExitError for the status itself.
 var ErrOOMKilled = errors.New("sandbox: killed by the memory limit")
 
+// CleanupError is returned by Run when the build ran but its cgroup could not
+// be removed afterwards. Build is what Run would otherwise have returned — nil
+// for a build that succeeded — and it stays reachable through errors.Is and
+// errors.As, so a caller reading the exit status still finds it. The cleanup
+// failure is the operator's problem, not the build's: a cgroup left behind is
+// a kernel object leaked once per job, and the leak ends in ENOSPC on the
+// hierarchy, so it must be seen, but it says nothing about what the build did.
+type CleanupError struct {
+	Build   error
+	Cleanup error
+}
+
+func (e *CleanupError) Error() string {
+	if e.Build == nil {
+		return e.Cleanup.Error()
+	}
+	return fmt.Sprintf("%v (and %v)", e.Build, e.Cleanup)
+}
+
+func (e *CleanupError) Unwrap() []error { return []error{e.Build, e.Cleanup} }
+
 // ChildArg is the argv[1] sentinel that marks a process as the re-executed
 // child stage. It is exported because a binary that dispatches on its own
 // subcommands has to know which one not to claim.
@@ -57,6 +78,9 @@ const (
 	envRootfs   = "FORGE_SANDBOX_ROOTFS"
 	envHostname = "FORGE_SANDBOX_HOSTNAME"
 	envScratch  = "FORGE_SANDBOX_SCRATCH_BYTES"
+	// envPreflight makes the child build the whole sandbox and exit 0 in
+	// place of exec'ing anything. See Preflight.
+	envPreflight = "FORGE_SANDBOX_PREFLIGHT"
 
 	defaultHostname = "forge"
 )
@@ -107,6 +131,8 @@ type Spec struct {
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
+
+	preflight bool
 }
 
 func (s *Spec) validate() error {

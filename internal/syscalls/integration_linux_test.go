@@ -113,6 +113,80 @@ func TestSyscallsAreCountedPerJobAndDoNotMix(t *testing.T) {
 	}
 }
 
+// TestADeniedSyscallIsCountedOnlyAsENOSYS pins down what each count can see. The
+// kernel runs the seccomp filter before the sys_enter tracepoint, and a call
+// the filter denies returns without reaching it, so a build hammering a
+// denied syscall adds nothing for it here. What the histogram does count is
+// Forge's own sandbox setup, which runs in the job's cgroup before the filter
+// is installed: its mounts (the first CI run counted exactly eleven — private
+// remount, scratch tmpfs, overlay, proc, the /dev tmpfs, six device binds) and
+// its pivot_root.
+//
+// So a job that tries mount two hundred times is compared with one that never
+// tries: the two mount counts must be equal, both being the setup's. The
+// control is execve: each attempt forks and execs the mount applet, so a count
+// at least the loop's length proves the attempts ran and were attributed, and
+// equal mount counts then mean "not visible" rather than "not run".
+//
+// The denials do reach the sys_exit tracepoint, carrying the filter's ENOSYS,
+// and that is what EnosysMetricName counts: at least one per attempt for the
+// job that tried, none for the job that did not.
+func TestADeniedSyscallIsCountedOnlyAsENOSYS(t *testing.T) {
+	rootfs := os.Getenv("FORGE_TEST_ROOTFS")
+	if os.Geteuid() != 0 || rootfs == "" {
+		t.Skip("needs root and FORGE_TEST_ROOTFS: run `make test-syscalls`")
+	}
+	var reg metrics.Registry
+	obs, err := Load(&reg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatalf("Load: %v", err)
+		}
+		t.Skipf("BPF unavailable: %v", err)
+	}
+	defer obs.Close()
+
+	root := mkCgroupRoot(t)
+	run := func(script string) map[uint64]int64 {
+		t.Helper()
+		before := snapshotAll(obs)
+		var out strings.Builder
+		err := sandbox.Run(context.Background(), sandbox.Spec{
+			Rootfs: rootfs, CgroupRoot: root, Observe: obs.Job(),
+			Args: []string{"/bin/sh", "-c", script}, Stdout: &out, Stderr: &out,
+		})
+		t.Logf("%q: err %v, output %q", script[:min(len(script), 40)], err, strings.TrimSpace(out.String()))
+		return deltaAll(snapshotAll(obs), before)
+	}
+
+	const tries = 200
+	quiet := run("true")
+	loud := run(fmt.Sprintf("i=0; while [ $i -lt %d ]; do mount -t tmpfs t /mnt 2>/dev/null; i=$((i+1)); done; mount -t tmpfs t /mnt", tries))
+	t.Logf("no attempts:   %s", top(quiet))
+	t.Logf("%d attempts: %s", tries, top(loud))
+
+	mount, execve, pivot := uint64(unix.SYS_MOUNT), uint64(unix.SYS_EXECVE), uint64(unix.SYS_PIVOT_ROOT)
+	if loud[execve] < tries {
+		t.Fatalf("execve counted %d, want >= %d: the mount attempts did not run or were not attributed, so equal mount counts would prove nothing", loud[execve], tries)
+	}
+	if quiet[mount] == 0 || quiet[pivot] == 0 {
+		t.Fatalf("the setup's mount (%d) and pivot_root (%d) were not counted: the histogram is expected to include Forge's own sandbox setup", quiet[mount], quiet[pivot])
+	}
+	if loud[mount] != quiet[mount] {
+		t.Fatalf("mount counted %d with %d denied attempts and %d with none: denied calls reached the tracepoint", loud[mount], tries, quiet[mount])
+	}
+	t.Logf("ENOSYS for mount: %d with %d attempts, %d with none", loud[mount|enosysTag], tries, quiet[mount|enosysTag])
+	if obs.exitLink == nil {
+		t.Fatal("the sys_exit ENOSYS counter did not attach")
+	}
+	if n := loud[mount|enosysTag]; n < tries {
+		t.Fatalf("ENOSYS for mount counted %d, want >= %d: one per denied attempt", n, tries)
+	}
+	if n := quiet[mount|enosysTag]; n != 0 {
+		t.Fatalf("ENOSYS for mount counted %d for a job that never tried: the setup's own mounts succeed", n)
+	}
+}
+
 // snapshotAll reads every syscall counter's current value.
 func snapshotAll(o *Observer) map[uint64]int64 {
 	m := make(map[uint64]int64, len(o.counters))

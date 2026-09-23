@@ -29,8 +29,9 @@ sudo ROOTFS=/var/lib/forge/rootfs make rootfs
 every file's owner into the sandbox's uid map — uid 0 in the image becomes
 524288 on the host. The shift is what lets the per-job overlay copy files
 up; an image unpacked by hand needs `sudo hack/shift-rootfs.sh <path>` once.
-The worker refuses nothing here, but every build on an unshifted image
-fails its first write with `EOVERFLOW`.
+An unshifted image builds a sandbox without complaint, and every build on
+it then fails its first write with `EOVERFLOW`. The worker's startup
+preflight checks for this and refuses to start with an unshifted image.
 
 Any image will do, not only Alpine: unpack it, shift it, point `-rootfs`
 at it. Whatever the jobs run has to already be in it — the sandbox has no
@@ -45,13 +46,14 @@ to `/etc/systemd/system/`, write the two environment files, and enable.
 sudo useradd --system --home /nonexistent --shell /usr/sbin/nologin forge
 sudo install -d -m 0750 -o root -g forge /etc/forge
 echo 'FORGE_DSN=postgres://forge:...@db.internal/forge' | sudo tee /etc/forge/api.env /etc/forge/worker.env >/dev/null
+echo "FORGE_API_TOKEN=$(openssl rand -hex 32)" | sudo tee -a /etc/forge/api.env >/dev/null
 sudo chmod 0640 /etc/forge/*.env
 sudo cp deploy/forge-api.service deploy/forge-worker.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now forge-api forge-worker
 ```
 
-**The worker runs as root.** Building the sandbox — the clone into six
+**The worker runs as root.** Building the sandbox — the clone into seven
 namespaces, the mounts, `pivot_root` — needs `CAP_SYS_ADMIN` on the host
 side. The build inside runs as uid 524288 with nine capabilities and a
 syscall allowlist; the README's *Limitations* say exactly what that bounds.
@@ -62,10 +64,21 @@ unit's cgroup subtree to the worker, which creates one cgroup per job under
 job fails at `cgroup.Create`. The unit's `-cgroup-root` names its own
 subtree, `/sys/fs/cgroup/system.slice/forge-worker.service`.
 
-**The API runs as `forge`**, unprivileged, on loopback. It has no
-authentication of its own: put it behind whatever does — a reverse proxy
-with client certificates or a bearer token — and never on an interface a
-build can reach. `/metrics` is on the same listener.
+**The API runs as `forge`**, unprivileged, on loopback. Every route,
+`/metrics` included, wants `Authorization: Bearer $FORGE_API_TOKEN`, and
+`forge-api` will not start without the token — an `api.env` holding only
+`FORGE_DSN` leaves the unit restart-looping on exit status 2. The token is
+one shared secret over plain HTTP, so anything past loopback wants TLS in
+front; a proxy that authenticates on its own can run the API with
+`-insecure-no-auth` instead. Never on an interface a build can reach.
+
+**Starting.** Before it claims anything, the worker builds one complete
+sandbox and runs nothing in it. It also checks that the image is shifted into
+the uid map. If either fails, it exits 1 with the reason: missing delegation,
+a masked `/proc`, an unshifted image. The alternative is a worker that takes
+every job in the queue and reports each one as a setup failure. A unit that
+restart-loops on start is the preflight doing its job; `journalctl -u
+forge-worker` has the reason.
 
 **Stopping.** `systemctl stop forge-worker` sends `SIGTERM`, which drains:
 the jobs in hand finish, no more are claimed. `TimeoutStopSec=300` is how
@@ -93,9 +106,10 @@ Both binaries speak the Prometheus text format; scrape them.
 |---|---|---|
 | API `/metrics` | `forge_queue_jobs{state}` | jobs queued, running, done — the depth |
 | worker `-metrics addr` | `forge_jobs_claimed_total` | claims this worker made |
-| | `forge_jobs_done_total{outcome}` | `ok`, `failed`, `oom`, `killed`, `setup`, `given_up` |
+| | `forge_jobs_done_total{outcome}` | `ok`, `failed`, `oom`, `killed`, `setup`, `given_up`, `timeout` |
 | | `forge_lease_lost_total` | heartbeats refused: a job this worker held was reclaimed |
 | | `forge_jobs_running` | jobs in hand now |
+| | `forge_sandbox_cleanup_failures_total` | job cgroups that could not be removed: each is a leaked kernel object, and any rise needs looking at |
 
 `forge_lease_lost_total` rising on a healthy worker means `-lease` is
 shorter than a heartbeat can reliably be delivered — a database or network

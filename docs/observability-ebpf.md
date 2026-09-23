@@ -15,8 +15,9 @@ decision that is the owner's, exactly as the queue's PostgreSQL driver was
 Make each job's syscall behaviour observable — a per-job histogram of which
 syscalls a build made, and how often — exported through the metrics the worker
 already serves. This turns "the filter allows 192 syscalls" from a static claim
-into a running measurement: which of those 192 a real build actually uses, and
-whether anything is reaching for the edge of the allowlist.
+into a running measurement: which of those 192 a real build actually uses.
+(Not what it tried and was refused: a denied syscall never reaches the
+tracepoint. See [What the histogram can and cannot see](#what-the-histogram-can-and-cannot-see).)
 
 It must not weaken the sandbox. Observation is read-only, runs **outside** the
 sandbox in the worker, and never gives the build a new capability, syscall,
@@ -158,3 +159,39 @@ none of it runs on macOS:
    write-heavy build's openat count stays small while the test process itself
    makes thousands, which is the proof the filter counts the job and not the
    machine.
+
+### What the histogram can and cannot see
+
+Two properties that are easy to assume the wrong way round. Both are pinned by
+`TestADeniedSyscallIsCountedOnlyAsENOSYS` on a real kernel.
+
+**A syscall the seccomp filter denies is not counted.** The kernel runs the
+filter before the `sys_enter` tracepoint, and a denied call returns without
+reaching it. In CI, a job that tried `mount` 201 times (every attempt got
+`ENOSYS`) and a job that never tried both counted **exactly 11** mounts. Those
+11 came from Forge itself; the attempts were not counted at all. So the
+histogram is the *allowed* surface a build actually used. It is not a record
+of what the build tried and was refused.
+
+**A denied syscall is counted at `sys_exit`, as ENOSYS.** The exit tracepoint
+still fires for a call the filter skipped, carrying the filter's `-ENOSYS`. A
+second program, on `raw_syscalls:sys_exit`, counts per job only the calls that
+returned ENOSYS, into `forge_job_syscalls_enosys_total{nr}`. That means denied
+by the filter or not implemented by the kernel; for a build, both mean it
+asked for something it could not have. This is where a build probing the
+filter shows up. In CI, the job that tried `mount` 201 times counted at least
+200 mount ENOSYS returns, and the job that never tried counted none
+(`TestADeniedSyscallIsCountedOnlyAsENOSYS`). It uses a tracepoint rather than
+a raw tracepoint because the record already holds the decoded syscall number,
+so no per-architecture `pt_regs` offset is read. The same counts came out on
+both architectures: amd64 in CI, and arm64 in the development VM (kernel
+6.8.0-100, where `mount` is nr 40 rather than 165). That was the first run of
+either program on arm64. If it fails to attach, it logs one line and the
+histogram is unaffected.
+
+**Forge's own sandbox setup is counted.** The re-executed child builds the
+sandbox inside the job's cgroup, before the filter exists: its private
+remount, scratch tmpfs, overlay, `/proc`, the `/dev` tmpfs and six device
+binds are the 11 mounts above, and `pivot_root` shows up too. Every job
+carries this fixed baseline. Subtract a no-op job's histogram to see what the
+build alone did.
