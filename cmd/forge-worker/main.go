@@ -45,6 +45,7 @@ func main() {
 		diskMB         = flag.Int64("disk-mb", 0, "writable-layer (disk + inode) limit per job in MiB (0 for unlimited)")
 		cgroupRoot     = flag.String("cgroup-root", cgroup.DefaultRoot, "parent cgroup for the jobs' cgroups")
 		metricsAt      = flag.String("metrics", "", "address to serve /metrics on (empty for none)")
+		retain         = flag.Duration("retain", 0, "delete finished jobs this long after they finish; 0 keeps them forever")
 		syscallMetrics = flag.Bool("syscall-metrics", false, "count each job's syscalls via eBPF and export them (Linux, needs CAP_BPF; off is a no-op)")
 	)
 	flag.Parse()
@@ -65,6 +66,9 @@ func main() {
 		os.Exit(1)
 	}
 	defer q.Close()
+	if *retain > 0 {
+		go prune(ctx, q, *retain, log)
+	}
 
 	stop := make(chan struct{})
 	sigs := make(chan os.Signal, 2)
@@ -119,4 +123,26 @@ func main() {
 	log.Info("worker started", "name", *name, "workers", *workers, "rootfs", *rootfs)
 	w.Serve(ctx, stop, *workers)
 	log.Info("worker exited cleanly")
+}
+
+// prune deletes finished jobs older than retain. It runs every tenth of
+// retain, clamped between once a minute and once an hour. Every worker runs
+// it; a DELETE of rows another worker already deleted removes nothing, so they
+// need no coordination.
+func prune(ctx context.Context, q *queue.Queue, retain time.Duration, log *slog.Logger) {
+	t := time.NewTicker(min(max(retain/10, time.Minute), time.Hour))
+	defer t.Stop()
+	for {
+		n, err := q.Prune(ctx, retain)
+		if err != nil {
+			log.Warn("prune failed", "err", err)
+		} else if n > 0 {
+			log.Info("pruned finished jobs", "count", n, "older_than", retain)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
 }

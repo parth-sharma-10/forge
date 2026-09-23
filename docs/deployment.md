@@ -94,6 +94,9 @@ another worker reclaims them.
   reclaims them. Shorter reclaims faster and heartbeats more often.
 - `-max-attempts` (3) is how many workers a job may kill before it is
   given up.
+- `-retain` (off) deletes finished jobs that long after they finish. Each
+  job row keeps up to a megabyte of log, so without it the table only grows.
+  `-retain 168h` keeps a week.
 
 ## Metrics
 
@@ -128,6 +131,8 @@ Two things help, and the second is the one to do:
 - lower the autovacuum thresholds on `jobs` —
   `ALTER TABLE jobs SET (autovacuum_vacuum_scale_factor = 0.01,
   autovacuum_vacuum_cost_delay = 0)`;
-- delete or archive `done` rows on a schedule. Nothing in Forge reads a
-  done row again except `GET /jobs/{id}`; how long that has to work is a
-  retention decision Forge does not make for you.
+- delete `done` rows on a schedule: `forge-worker -retain 168h` keeps a
+  week. Nothing in Forge reads a done row again except `GET /jobs/{id}` and
+  the listing, so the window is how long those have to keep working. The
+  flag is off by default, because deleting results is a decision Forge
+  leaves to you.
