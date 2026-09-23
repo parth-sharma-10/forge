@@ -391,3 +391,18 @@ func (q *Queue) List(ctx context.Context, state string, before int64, limit int)
 	}
 	return out, rows.Err()
 }
+
+// Prune deletes the jobs that finished more than olderThan ago and returns how
+// many it removed. Queued and running jobs are never touched. Without it the
+// table only grows, by up to a megabyte of log per job.
+//
+// ponytail: a sequential scan of the done rows each call. An index on
+// finished_at is the upgrade when the table is large enough for that to show.
+func (q *Queue) Prune(ctx context.Context, olderThan time.Duration) (int64, error) {
+	tag, err := q.db.Exec(ctx, `
+		DELETE FROM jobs WHERE state = 'done' AND finished_at < now() - $1::interval`, olderThan)
+	if err != nil {
+		return 0, fmt.Errorf("queue: prune: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
