@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +58,15 @@ func probe(what string) {
 		os.Exit(0)
 	case "fd-leak":
 		fdLeak()
+		os.Exit(0)
+	case "out-socket":
+		// A bound unix socket left in the artifact directory. The listener
+		// is never closed: Close would unlink the path.
+		os.MkdirAll(ArtifactDir, 0o755)
+		if _, err := net.Listen("unix", ArtifactDir+"/sock"); err != nil {
+			fmt.Println("listen:", err)
+		}
+		os.WriteFile(ArtifactDir+"/zz", []byte("after the socket"), 0o644)
 		os.Exit(0)
 	default:
 		fmt.Println("probe: unknown", what)
@@ -136,6 +146,16 @@ func fdLeak() {
 // the build, in probe mode.
 func runProbe(t *testing.T, what string) string {
 	t.Helper()
+	out, err := runSpec(t, Spec{Rootfs: probeImage(t), Args: []string{"/forge-probe", probeArg, what}})
+	if err != nil {
+		t.Fatalf("probe %s: %v (output %q)", what, err, out)
+	}
+	return out
+}
+
+// probeImage is a scratch image with the test binary in it as /forge-probe.
+func probeImage(t *testing.T) string {
+	t.Helper()
 	dir := scratchImage(t)
 	self, err := os.ReadFile("/proc/self/exe")
 	if err != nil {
@@ -144,11 +164,7 @@ func runProbe(t *testing.T, what string) string {
 	if err := os.WriteFile(filepath.Join(dir, "forge-probe"), self, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	out, err := runSpec(t, Spec{Rootfs: dir, Args: []string{"/forge-probe", probeArg, what}})
-	if err != nil {
-		t.Fatalf("probe %s: %v (output %q)", what, err, out)
-	}
-	return out
+	return dir
 }
 
 const rootfsEnv = "FORGE_TEST_ROOTFS"

@@ -5,6 +5,7 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -113,6 +114,18 @@ func Run(ctx context.Context, spec Spec) (err error) {
 		cmd.Env = append(cmd.Env, envPreflight+"=1")
 	}
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = spec.Stdin, spec.Stdout, spec.Stderr
+	var artifacts *os.File
+	if spec.Artifacts != nil {
+		r, w, err := os.Pipe()
+		if err != nil {
+			return fmt.Errorf("sandbox: artifact pipe: %w", err)
+		}
+		defer r.Close()
+		defer w.Close()
+		artifacts = r
+		cmd.ExtraFiles = []*os.File{w} // artifactFD in the child
+		cmd.Env = append(cmd.Env, envArtifactBytes+"="+strconv.FormatInt(spec.ArtifactBytes, 10))
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: namespaces,
 		// A worker that dies mid-build must not leave the build running: the
@@ -147,7 +160,27 @@ func Run(ctx context.Context, spec Spec) (err error) {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("sandbox: start child (needs CAP_SYS_ADMIN — run as root): %w", err)
 	}
+	var killedBy syscall.Signal
+	collected := make(chan struct{})
+	if artifacts != nil {
+		// The parent's copy of the write end has to go, or the read below
+		// never sees EOF.
+		cmd.ExtraFiles[0].Close()
+		go func() {
+			defer close(collected)
+			killedBy = collect(artifacts, spec.Artifacts, spec.ArtifactBytes)
+			if killedBy != 0 {
+				cmd.Process.Kill()
+			}
+		}()
+	} else {
+		close(collected)
+	}
 	runErr := cmd.Wait()
+	<-collected
+	if killedBy != 0 && runErr != nil {
+		runErr = fmt.Errorf("sandbox: the build was killed by %v: %w", killedBy, runErr)
+	}
 
 	// Asked after the wait and before Close removes the cgroup: this is the
 	// only moment the counter is both final and still readable.
@@ -159,6 +192,24 @@ func Run(ctx context.Context, spec Spec) (err error) {
 		}
 	}
 	return runErr
+}
+
+// collect reads what the supervisor writes to the artifact pipe: one byte,
+// the signal that killed the build or zero if it exited, and after a zero
+// the archive, copied to w up to limit bytes. It returns the signal. The
+// supervisor caps the archive itself; the limit here is so a supervisor that
+// did not — a bug — still cannot make the worker hold more.
+//
+// The read end is closed on the way out, so a supervisor still writing gets
+// EPIPE rather than blocking.
+func collect(r *os.File, w io.Writer, limit int64) syscall.Signal {
+	defer r.Close()
+	var fate [1]byte
+	if _, err := io.ReadFull(r, fate[:]); err != nil || fate[0] != 0 {
+		return syscall.Signal(fate[0])
+	}
+	io.Copy(w, io.LimitReader(r, limit))
+	return 0
 }
 
 // Preflight builds the sandbox spec describes — its cgroup, the namespaces,
@@ -521,8 +572,17 @@ func child() error {
 		}
 	}
 
+	// Set only when the job collects artifacts; the build then runs under a
+	// supervisor rather than as PID 1. See supervise.
+	artifactBytes, _ := strconv.ParseInt(os.Getenv(envArtifactBytes), 10, 64)
+
 	if err := dropBoundingSet(); err != nil {
 		return err
+	}
+	if artifactBytes > 0 {
+		if err := limitSupervisor(); err != nil {
+			return err
+		}
 	}
 	if err := applySeccomp(); err != nil {
 		return err
@@ -530,7 +590,11 @@ func child() error {
 	if preflight {
 		os.Exit(0)
 	}
-	return syscall.Exec(path, argv, []string{"PATH=" + sandboxPATH, "HOME=/root"})
+	env := []string{"PATH=" + sandboxPATH, "HOME=/root"}
+	if artifactBytes > 0 {
+		return supervise(path, argv, env, artifactBytes)
+	}
+	return syscall.Exec(path, argv, env)
 }
 
 // checkShifted confirms the image's root directory belongs to root of the
