@@ -97,13 +97,16 @@ func TestASymlinkInOutIsRecordedNotFollowed(t *testing.T) {
 // bind is on the allowlist, so a build can leave a socket in /out. The walk
 // skips it without blocking, and says so.
 func TestASocketInOutIsSkippedWithoutBlocking(t *testing.T) {
+	// Built here, not in the goroutine: a skip there would end only the
+	// goroutine, and the test would go on to fail on a machine without root.
+	spec := Spec{Rootfs: probeImage(t), Args: []string{"/forge-probe", probeArg, "out-socket"}}
 	done := make(chan struct{})
 	var out string
 	var got map[string]entry
 	var err error
 	go func() {
 		defer close(done)
-		out, got, err = collectRun(t, Spec{Rootfs: probeImage(t), Args: []string{"/forge-probe", probeArg, "out-socket"}}, 1<<20)
+		out, got, err = collectRun(t, spec, 1<<20)
 	}()
 	select {
 	case <-done:
