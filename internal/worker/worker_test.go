@@ -379,3 +379,52 @@ func TestACancelledJobPastItsAttemptCapIsReportedCancelled(t *testing.T) {
 		t.Fatalf("reported %+v, want error %q", r, queue.ReasonCancelled)
 	}
 }
+
+// The archive comes back with a build that exited, failed or not, and not
+// with one that was killed: its archive is partial.
+func TestArtifactsAreReportedOnlyForABuildThatExited(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		exit error
+		want string
+	}{
+		{"ok", nil, "TAR"},
+		{"failed", exitWith(7), "TAR"},
+		{"killed", exec.Command("sh", "-c", "kill -9 $$").Run(), ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newStore([]string{"make"})
+			var got sandbox.Spec
+			w := &Worker{Store: store, Rootfs: "/img", Lease: time.Second, Poll: 10 * time.Millisecond,
+				ArtifactBytes: 1 << 20,
+				Run: func(_ context.Context, spec sandbox.Spec) error {
+					got = spec
+					spec.Artifacts.Write([]byte("TAR"))
+					return tc.exit
+				}}
+			serve(t, w)
+			r := store.waitReport(t)
+			if got.ArtifactBytes != 1<<20 {
+				t.Errorf("spec.ArtifactBytes = %d, want the worker's cap", got.ArtifactBytes)
+			}
+			if string(r.Artifact) != tc.want {
+				t.Errorf("reported artifact %q, want %q (exit %d)", r.Artifact, tc.want, r.ExitCode)
+			}
+		})
+	}
+}
+
+func TestNoArtifactsUnlessAsked(t *testing.T) {
+	store := newStore([]string{"make"})
+	var got sandbox.Spec
+	w := &Worker{Store: store, Rootfs: "/img", Lease: time.Second, Poll: 10 * time.Millisecond,
+		Run: func(_ context.Context, spec sandbox.Spec) error {
+			got = spec
+			return nil
+		}}
+	serve(t, w)
+	store.waitReport(t)
+	if got.Artifacts != nil {
+		t.Error("a worker with no ArtifactBytes asked the sandbox for artifacts")
+	}
+}

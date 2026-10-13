@@ -88,6 +88,19 @@ func (s *fakeStore) List(_ context.Context, state string, before int64, limit in
 	return out[:min(limit, len(out))], nil
 }
 
+func (s *fakeStore) Artifact(_ context.Context, id int64) ([]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.jobs[id]
+	switch {
+	case !ok:
+		return nil, queue.ErrNotFound
+	case st.State != "done":
+		return nil, queue.ErrNotDone
+	}
+	return st.Result.Artifact, nil
+}
+
 // set is the worker's side: what a heartbeat or a report would have written.
 func (s *fakeStore) set(id int64, st queue.Status) {
 	s.mu.Lock()
@@ -346,5 +359,40 @@ func TestListRejectsBadQueries(t *testing.T) {
 		if resp, _ := get(t, srv.URL+"/jobs?"+q); resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("GET /jobs?%s: %d, want 400", q, resp.StatusCode)
 		}
+	}
+}
+
+func TestArtifact(t *testing.T) {
+	srv, store := newServer(t)
+	if resp, _ := get(t, srv.URL+"/jobs/9/artifact"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("unknown job: %d, want 404", resp.StatusCode)
+	}
+	if resp, _ := get(t, srv.URL+"/jobs/x/artifact"); resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("bad id: %d, want 400", resp.StatusCode)
+	}
+	store.set(1, queue.Status{State: "running"})
+	if resp, _ := get(t, srv.URL+"/jobs/1/artifact"); resp.StatusCode != http.StatusConflict {
+		t.Errorf("running job: %d, want 409", resp.StatusCode)
+	}
+	store.set(2, queue.Status{State: "done"})
+	if resp, _ := get(t, srv.URL+"/jobs/2/artifact"); resp.StatusCode != http.StatusNotFound {
+		t.Errorf("done job with no artifact: %d, want 404", resp.StatusCode)
+	}
+
+	store.set(3, queue.Status{State: "done", Result: queue.Result{Artifact: []byte("TAR"), ArtifactBytes: 3}})
+	resp, body := get(t, srv.URL+"/jobs/3/artifact")
+	if resp.StatusCode != http.StatusOK || body != "TAR" {
+		t.Fatalf("artifact: %d %q, want 200 TAR", resp.StatusCode, body)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-tar" {
+		t.Errorf("Content-Type = %q", ct)
+	}
+	if cd := resp.Header.Get("Content-Disposition"); !strings.HasPrefix(cd, "attachment") {
+		t.Errorf("Content-Disposition = %q, want an attachment", cd)
+	}
+	var j Job
+	_, body = get(t, srv.URL+"/jobs/3")
+	if err := json.Unmarshal([]byte(body), &j); err != nil || j.ArtifactBytes != 3 {
+		t.Errorf("job JSON %s: artifact_bytes %d, want 3", body, j.ArtifactBytes)
 	}
 }
