@@ -1,12 +1,12 @@
-# Artifacts — a design, not yet a feature
+# Artifacts
 
-Status: **designed, not built.** Nothing a build writes survives the job; the
-only output is stdout and stderr, through a 1 MiB log tail. Collecting files is
-the largest product gap left, and it is a security decision before it is a
-feature: [threat-model.md](threat-model.md) names artifact collection as a
-review trigger, because it is the first way a build's writes could leave its
-layer. The decision is the owner's; this document gives the options and the
-recommendation.
+Status: **built, option B** (decided 2026-10-14; see [Built](#built) at the
+end for where the build differs from the design). Before it, nothing a build
+wrote survived the job; the only output was stdout and stderr, through a 1 MiB
+log tail. Collecting files was the largest product gap left, and it is a
+security decision before it is a feature: it is the first way a build's writes
+leave its layer. What follows is the design as it was put to the owner, kept
+because the rejected options are the argument for the chosen one.
 
 ## The constraint
 
@@ -117,10 +117,56 @@ the consumer's boundary, and the endpoint's documentation has to say so.
   background process still writing `/out` after the build exits is dead
   before the walk.
 
-## Decision needed
+## Decision
 
-B, with the storage above, is the recommendation. It is roughly: the
-supervisor (~150 lines), a `Spec.Artifacts io.Writer`, a queue column, and one
-endpoint, each with the tests listed. The question for the owner is whether
-builds should be able to hand back files at all. Until the answer is yes, the
-sandbox stays as it is.
+B, with the storage above. The owner chose it on 2026-10-14.
+
+## Built
+
+`internal/sandbox/supervise_linux.go` (the supervisor), `archive.go` (the
+walk), `Spec.Artifacts`/`Spec.ArtifactBytes`, the `artifact` column,
+`GET /jobs/{id}/artifact`, and `forge-worker -artifact-mb` (default 16).
+
+Where it differs from the design above, and why:
+
+- **Off is exactly the old sandbox.** `-artifact-mb 0` leaves the build as
+  PID 1, exec'd over the child as before, and every existing test of that path
+  stands unchanged. The supervisor is a separate path, taken only when a job
+  collects artifacts.
+- **A killed build hands back nothing.** PID 1 cannot die of a signal it sends
+  itself, so the supervisor writes one byte to the pipe before the archive:
+  the signal that killed the build, or zero. On a signal the parent SIGKILLs
+  the supervisor, so `Run` still returns an `*exec.ExitError` with exit code
+  -1, and it wraps the real signal into the message ("killed by segmentation
+  fault"). The worker keeps an archive only for a build that exited with a
+  status of its own, failed or not. A killed build's archive may be partial;
+  one cut off by a timeout or a cancel always is.
+- **The supervisor is no stronger than the build.** The design said the
+  bounding set and the filter apply to the supervisor. They do, but the
+  bounding set only limits what an `execve` confers, not what a process already
+  holds. Without more, the supervisor would walk the build's tree holding every
+  capability of its user namespace, `CAP_SYS_ADMIN` included. Before the filter
+  goes on it cuts its own capability sets to the build's keep list (`capset`),
+  and it marks itself non-dumpable, so the build cannot ptrace it or read
+  `/proc/1/mem`.
+- **The cap stops the walk; nothing is skipped to fit.** The walk is in
+  lexical order. It stops before the first entry whose header and data would
+  not fit with the tar trailer, so the archive is a well-formed prefix of the
+  tree. The supervisor says where it stopped on stderr, which is the job's log.
+  Sockets, FIFOs and devices are skipped and counted in the same place.
+- **No `/out`, no artifact.** The column stays NULL and the endpoint answers
+  404. A `/out` that is not a directory (a symlink to one, say) is reported
+  in the log and collects nothing.
+
+Measured on the arm64 colima VM: the supervisor is **4.4 MB resident** while
+the build runs (`TestTheSupervisorIsNoStrongerThanTheBuild -v`), charged to
+the job's cgroup. Its setup cost is `BenchmarkRunSupervised` against
+`BenchmarkRun`; see the README's numbers.
+
+Tests: `TestArchive*` (portable; symlinks, FIFOs and sockets, the cap with
+long names and with empty files) and `supervise_linux_test.go` (as root: exit
+status, signal, symlink, socket, over-cap, a background process dead before
+the walk, orphans reaped under a pids limit, the supervisor's capabilities and
+dumpability, no pipe in the build). The worker's end-to-end test runs every job
+supervised, including the OOM kill and the cancel. Each property was checked
+by breaking it and watching the named test fail.

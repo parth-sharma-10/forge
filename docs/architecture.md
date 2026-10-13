@@ -33,7 +33,9 @@ client / GitHub webhook
 - **forge-api** — HTTP API, job submission, log fan-out, webhook ingestion.
 - **forge-worker** — claims jobs, holds leases, drives the sandbox, streams logs.
 - **forged** — the sandbox runtime. Re-executes itself as `child`, applies
-  isolation, runs the build command as PID 1 of its own PID namespace.
+  isolation, runs the build command as PID 1 of its own PID namespace, or,
+  when the job collects artifacts, as the child of a supervisor that is PID 1
+  and tars `/out` once everything else in the namespace is dead.
 - **PostgreSQL** — durable state *and* the queue. No Redis, no Kafka.
 
 ## Implemented
@@ -80,7 +82,7 @@ run. Delivery is at-least-once, and the row says how many times.
 ### internal/api — the HTTP front door (Phase 3)
 
 `POST /jobs` submits; `GET /jobs/{id}` reads state; `GET /jobs/{id}/logs`
-streams. Standard library `net/http`. The worker flushes its log tail with
+streams; `GET /jobs/{id}/artifact` serves the tar of a finished job's `/out`. Standard library `net/http`. The worker flushes its log tail with
 every heartbeat, so a followed log is at most one heartbeat behind; the
 follower re-reads the row every half second and writes what is new,
 comparing byte totals so that output the tail no longer holds is reported
@@ -150,6 +152,12 @@ forge-worker (or forged, or the test binary)
      v
 execve(build command)                    PID 1 of its own namespace
 ```
+
+With artifacts collected (`Spec.Artifacts`, `forge-worker -artifact-mb`), the
+last step is a fork instead: the child stays PID 1 as a supervisor, cuts its
+own capabilities to the build's, forks and execs the build, reaps until it
+exits, kills and reaps everything left, and writes a tar of `/out` to a pipe
+the worker reads ([artifacts.md](artifacts.md)).
 
 Both mounts happen before `pivot_root`, and neither is free to move: the
 device nodes are bind mounts of the host's, which after `pivot_root` is not a

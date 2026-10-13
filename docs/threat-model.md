@@ -44,7 +44,7 @@ accepted.
 | 1 | Be a privileged host user | User namespace: uid/gid 0..65535 inside → 524288..589823 outside, `Credential` moves the child onto the first | `sandbox_linux.go` | `TestSandboxRootIsAnUnprivilegedHostUid` |
 | 2 | Reach the host filesystem | Mount namespace, `MS_REC\|MS_PRIVATE`, bind + `pivot_root` + `umount2(MNT_DETACH)` | `sandbox_linux.go` | `TestHostFilesystemIsUnreachable`, `TestMountsDoNotLeakToHost` |
 | 3 | Write the shared image, or leave state behind | Per-job overlay on a tmpfs in the job's own mount namespace | `sandbox_linux.go` | `TestTheImageIsNeverWritten`, `TestNoWritableStateOutlivesAJob` |
-| 4 | See or signal host processes | PID namespace; build is PID 1 of its own | `sandbox_linux.go` | `TestCommandRunsAsPIDOne`, `TestProcIsTheSandboxProcessTable` |
+| 4 | See or signal host processes | PID namespace; the build is PID 1 of its own, or its child when artifacts are collected | `sandbox_linux.go` | `TestCommandRunsAsPIDOne`, `TestProcIsTheSandboxProcessTable` |
 | 5 | Reach the network | Network namespace with no interfaces at all | `sandbox_linux.go` | `TestNetworkNamespaceHasNoHostInterfaces` |
 | 6 | Share memory or message queues | IPC namespace | `sandbox_linux.go` | `TestEveryNamespaceIsNew` |
 | 7 | Reach the kernel-facing syscall surface | Deny-by-default seccomp allowlist (192 syscalls on amd64, 159 on arm64); `mount`, `pivot_root`, `ptrace`, `bpf`, `init_module`, `keyctl`, `perf_event_open`, `unshare` and the rest are absent from it | `seccomp_linux.go` | `TestFilterDeniesTheKernelFacingSurface`, `TestSeccompDeniesMount`, `TestSeccompDeniesMknod`, **`FuzzFilterMatchesPolicy`**, **`TestInstalledFilterMatchesTheModel`** |
@@ -59,6 +59,8 @@ accepted.
 | 16 | Learn where it sits in the host's cgroup tree | Cgroup namespace (`CLONE_NEWCGROUP`), created in the same clone that enters the job's cgroup, so its root is the job's cgroup | `sandbox_linux.go` | `TestSandboxRunsInsideItsOwnCgroup` (`/proc/self/cgroup` is `0::/`) |
 | 17 | Fill the disk, or exhaust inodes | The overlay's tmpfs is mounted with `size=` and `nr_inodes=` from `Spec.ScratchBytes` (`-disk-mb`): a fill gets `ENOSPC`, not an OOM kill | `sandbox_linux.go` | `TestTheDiskLimitStopsAHostileFill`, `TestTheInodeLimitStopsFileExhaustion` |
 | 18 | Hold a worker slot forever | Wall-clock deadline on the build's context (`-timeout`, 1h by default); expiry kills PID 1 and reports `timeout` | `internal/worker` | `TestAJobIsKilledWhenItTimesOut` |
+| 19 | Make artifact collection read outside `/out`, block, or exceed its cap | The walk runs inside the sandbox, in the supervisor, after `kill(-1, SIGKILL)` and a reap have emptied the PID namespace. Entries are `lstat`'d and symlinks are recorded, never followed. Only regular files are opened (`O_NOFOLLOW\|O_NONBLOCK`). The archive stops before the entry that would cross the cap, and the worker reads no more than the cap. | `archive.go`, `supervise_linux.go` | `TestASymlinkInOutIsRecordedNotFollowed`, `TestASocketInOutIsSkippedWithoutBlocking`, `TestArtifactsOverTheCapAreTruncatedAndReported`, `TestABackgroundProcessIsDeadBeforeTheWalk`, `TestArchive*` |
+| 20 | Take over the supervisor that collects its artifacts | Before the filter goes on, the supervisor cuts its capability sets to the build's keep list and makes itself non-dumpable, so the build cannot ptrace it or read its memory. The artifact pipe is close-on-exec. | `supervise_linux.go` | `TestTheSupervisorIsNoStrongerThanTheBuild`, `TestTheArtifactPipeDoesNotReachTheBuild` |
 
 Two properties fall out of the shape rather than being coded for: a build
 cannot outlive its context by forking away, because killing PID 1 of a PID
@@ -129,6 +131,20 @@ writeback pressure, or the kernel memory a build can pin through legitimate
 allocations. Without `-disk-mb` the upper layer has the kernel's default tmpfs
 cap of half of RAM, and a job's memory limit is what stops it first.
 
+**A build can end its own job early by signalling its supervisor.** When
+artifacts are collected, PID 1 is a Go process, and the Go runtime installs
+handlers for `SIGTERM`, `SIGQUIT` and the rest, so a build that signals PID 1
+can make the supervisor exit and take the sandbox with it. That ends only its
+own job, which the build could do by exiting. It cannot change what the
+supervisor reads or reports for a build that has already exited, because by
+then nothing of the build is running.
+
+**An artifact is hostile to whoever extracts it.** The tar holds what the build
+left in `/out`: symlinks that point anywhere are recorded as symlinks.
+`GET /jobs/{id}/artifact` serves it as an attachment, and a consumer that
+extracts it must refuse absolute names, `..`, and links out of the extraction
+root. That boundary is the consumer's, not Forge's.
+
 **Jobs share a uid range.** Every job on a worker maps to the same host uids.
 Since the overlay no two jobs share a writable filesystem, so what remains is
 on the host's side: anything a job created outside its layer — nothing today —
@@ -177,6 +193,6 @@ not been reproduced against a running Forge.
 This document is wrong the moment any of these changes, and each should bring
 it back for review: a syscall added to the allowlist; a capability added to the
 bounding set; anything new mounted into the sandbox (`/sys`, `/dev/ptmx`,
-`/dev/shm`); artifact collection, which gives a build a way to write outside
-its layer; a network interface; and any change to the uid map or to who the
-worker runs as.
+`/dev/shm`); any change to how artifacts are read (the walk in the supervisor)
+or where they go (one `bytea` column); a network interface; and any change to
+the uid map or to who the worker runs as.
