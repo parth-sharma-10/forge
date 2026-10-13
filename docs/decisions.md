@@ -806,7 +806,7 @@ it. The flag is per worker instead (`-artifact-mb`, default 16; 0 is the old
 sandbox exactly), because nothing yet needs two kinds of job on one worker.
 
 **Rejected: following the design's "the build is no longer PID 1" for every
-job.** The supervisor adds 4.4 MB resident and a fork to each job and puts a
+job.** The supervisor adds 4.4–10 MB resident and a fork to each job and puts a
 Go runtime's syscalls into the job's histogram. A worker that collects
 nothing should not pay for it.
 

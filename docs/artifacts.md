@@ -158,9 +158,10 @@ Where it differs from the design above, and why:
   404. A `/out` that is not a directory (a symlink to one, say) is reported
   in the log and collects nothing.
 
-Measured on the arm64 colima VM: the supervisor is **4.4 MB resident** while
-the build runs (`TestTheSupervisorIsNoStrongerThanTheBuild -v`), charged to
-the job's cgroup. Its setup cost is `BenchmarkRunSupervised` against
+Measured: the supervisor is **4.4 MB resident** while the build runs on the
+arm64 colima VM (a static binary) and **10.0 MB** on CI's amd64 runner (built
+with cgo), from `TestTheSupervisorIsNoStrongerThanTheBuild -v`. It is charged
+to the job's cgroup. Its setup cost is `BenchmarkRunSupervised` against
 `BenchmarkRun`; see the README's numbers.
 
 Tests: `TestArchive*` (portable; symlinks, FIFOs and sockets, the cap with

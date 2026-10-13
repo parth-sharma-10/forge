@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -60,11 +59,16 @@ func probe(what string) {
 		fdLeak()
 		os.Exit(0)
 	case "out-socket":
-		// A bound unix socket left in the artifact directory. The listener
-		// is never closed: Close would unlink the path.
+		// A bound unix socket left in the artifact directory. Raw syscalls,
+		// not package net: importing net links the test binary against the
+		// host's libc under cgo, and the image has none to load.
 		os.MkdirAll(ArtifactDir, 0o755)
-		if _, err := net.Listen("unix", ArtifactDir+"/sock"); err != nil {
-			fmt.Println("listen:", err)
+		fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
+		if err == nil {
+			err = syscall.Bind(fd, &syscall.SockaddrUnix{Name: ArtifactDir + "/sock"})
+		}
+		if err != nil {
+			fmt.Println("bind:", err)
 		}
 		os.WriteFile(ArtifactDir+"/zz", []byte("after the socket"), 0o644)
 		os.Exit(0)

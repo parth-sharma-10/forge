@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -117,17 +116,23 @@ func TestArchiveSkipsFIFOsAndSocketsWithoutBlocking(t *testing.T) {
 	if err := syscall.Mkfifo(filepath.Join(root, "fifo"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A unix socket path is limited to ~100 bytes, and TempDir's can be longer.
+	// A unix socket path is limited to ~100 bytes, and TempDir's can be
+	// longer, so it is bound short and moved in. Raw syscalls rather than
+	// package net, which would link this test binary against libc under cgo;
+	// see test-sandbox in the Makefile.
 	sockDir, err := os.MkdirTemp("/tmp", "forge")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(sockDir) })
-	l, err := net.Listen("unix", filepath.Join(sockDir, "s"))
+	fd, err := syscall.Socket(syscall.AF_UNIX, syscall.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l.Close()
+	defer syscall.Close(fd)
+	if err := syscall.Bind(fd, &syscall.SockaddrUnix{Name: filepath.Join(sockDir, "s")}); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.Rename(filepath.Join(sockDir, "s"), filepath.Join(root, "sock")); err != nil {
 		t.Fatal(err)
 	}
