@@ -216,9 +216,15 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		return
 	}
 	w.running.Inc()
-	buildCtx, cancelBuild := context.WithCancel(ctx)
+	// One context or the other, never both: a WithCancel made and then
+	// overwritten is never cancelled, and stays registered on ctx for the
+	// worker's lifetime — about 110 bytes leaked per job.
+	var buildCtx context.Context
+	var cancelBuild context.CancelFunc
 	if w.Timeout > 0 {
 		buildCtx, cancelBuild = context.WithTimeout(ctx, w.Timeout)
+	} else {
+		buildCtx, cancelBuild = context.WithCancel(ctx)
 	}
 	defer cancelBuild()
 
