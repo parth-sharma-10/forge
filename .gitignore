@@ -2,3 +2,4 @@
 /forge-worker
 /forged
 *.test
+.DS_Store

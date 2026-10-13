@@ -207,21 +207,6 @@ running job it answers `202`, and the worker's next heartbeat, at most two
 seconds later, kills the build and reports it `cancelled`. A job that has
 already finished answers `409`, and its result is kept.
 
-`POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
-running job it answers `202`, and the worker's next heartbeat, at most two
-seconds later, kills the build and reports it `cancelled`. A job that has
-already finished answers `409`, and its result is kept.
-
-`GET /jobs` lists jobs newest first, without their logs. It takes an optional
-`state=` filter and a `limit=` (default 50, maximum 500), and pages with
-`before=<id>`, whose value the previous page returns as `next`. Paging by id
-means a job submitted between two pages doesn't shift the second one.
-
-`POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
-running job it answers `202`, and the worker's next heartbeat, at most two
-seconds later, kills the build and reports it `cancelled`. A job that has
-already finished answers `409`, and its result is kept.
-
 `GET /jobs` lists jobs newest first, without their logs. It takes an optional
 `state=` filter and a `limit=` (default 50, maximum 500), and pages with
 `before=<id>`, whose value the previous page returns as `next`. Paging by id
@@ -302,13 +287,14 @@ internal/sandbox   namespaces, pivot_root, /dev  implemented
                    user namespace and id map     implemented
 internal/cgroup    cgroups v2 memory/cpu/pids    implemented
 internal/queue     PostgreSQL queue, leases      implemented
+internal/syscalls  eBPF per-job syscall counts   implemented, opt-in
 docs/              architecture, decisions, failures
 ```
 
 ## Requirements
 
-Go 1.27+, PostgreSQL for the queue, and one third-party dependency: `pgx/v5`,
-its driver.
+Go 1.27+, PostgreSQL for the queue, and two direct third-party dependencies: `pgx/v5`,
+its driver, and `cilium/ebpf`, for the optional syscall metrics.
 
 The sandbox needs `CAP_SYS_ADMIN` and a Linux kernel with cgroups v2 and
 `CLONE_INTO_CGROUP` — 5.7 or newer. It re-executes itself after dropping to the
@@ -366,11 +352,10 @@ attempt count says it happened, and nothing makes the second run unnecessary
 — idempotent jobs are the caller's business.
 
 The API's authentication is one shared bearer token, not users or roles. It
-has no way to cancel or list jobs, and no
-webhook — a webhook is a client of `POST /jobs` and can live anywhere.
+has no webhook — a webhook is a client of `POST /jobs` and can live anywhere.
 
-The benchmark numbers above are from one small VM. They are what the
-harness produced there and nothing more.
+The benchmark numbers above are from one CI run on one shared runner. They
+are what the harness produced there and nothing more.
 
 [docs/threat-model.md](docs/threat-model.md) is the whole of this — what each
 boundary is, the code and test that hold it, and what Forge does not defend
