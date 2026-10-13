@@ -159,10 +159,12 @@ Where it differs from the design above, and why:
   in the log and collects nothing.
 
 Measured: the supervisor is **4.4 MB resident** while the build runs on the
-arm64 colima VM (a static binary) and **10.0 MB** on CI's amd64 runner (built
-with cgo), from `TestTheSupervisorIsNoStrongerThanTheBuild -v`. It is charged
-to the job's cgroup. Its setup cost is `BenchmarkRunSupervised` against
-`BenchmarkRun`; see the README's numbers.
+arm64 colima VM and **7.9 MB** on CI's amd64 runner
+(`TestTheSupervisorIsNoStrongerThanTheBuild -v`), charged to the job's
+cgroup. On CI, a `/bin/true` job took **3.48 ms supervised against 3.38 ms**
+as PID 1 (`BenchmarkRunSupervised`, `BenchmarkRun`, 20 runs each). That 0.1 ms
+is within the noise of 20 runs; the claim it supports is "no measurable
+setup cost", not a number.
 
 Tests: `TestArchive*` (portable; symlinks, FIFOs and sockets, the cap with
 long names and with empty files) and `supervise_linux_test.go` (as root: exit
