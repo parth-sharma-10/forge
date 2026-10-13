@@ -721,6 +721,37 @@ The feature is behind `-syscall-metrics` (default off) and degrades to a
 logged line on any host that cannot load it, so the common deployment carries
 none of it.
 
+## 2026-09-22 — API auth is a static bearer token, default-deny
+
+The API authenticates every route with one shared bearer token, compared in
+constant time, and `forge-api` refuses to start without one unless
+`-insecure-no-auth` is passed. Forge targets trusted/internal workloads: the
+token gates who may submit builds, and that is the whole identity model.
+
+Rejected, for now: mTLS and per-user tokens with roles. mTLS is the stronger
+boundary and the likely next step for a networked deployment, but it moves the
+hard part (certificate issuance and rotation) outside Forge, and a shared token
+behind a TLS-terminating proxy is the shape most internal deployments actually
+run. Per-user identity has nothing to authorize yet — there is no per-user
+resource to scope — so it would be a model without a use. Default-deny is the
+part that is not negotiable: an execution API must not come up open by accident.
+
+## 2026-09-22 — Per-job uid isolation waits on idmapped mounts
+
+Every job on a worker maps to the same host uid range (`524288..589823`). Real
+per-job ranges are deferred, and deliberately not faked with a per-job offset.
+
+Why it is not a config knob: the shared image is pre-shifted to this one range
+by `hack/shift-rootfs.sh` so the overlay can copy files up. Give a job a
+different range and the image is owned by ids it cannot read, and copy-up
+breaks. The correct fix is an **idmapped mount** of the read-only lower layer
+per job, so one on-disk image presents different ownership to each job without
+a second copy. That is a real change to the mount path, with its own tests and
+kernel-version floor (5.12+), and it is worth doing as its own change rather
+than bolted onto a hardening pass. Until then the shared range is safe only
+because the overlay gives no two jobs a shared writable filesystem — documented
+in the threat model, not implied away.
+
 ## 2026-09-22 — Cancellation rides the heartbeat
 
 **`POST /jobs/{id}/cancel` sets a flag on the row; the worker learns of it
