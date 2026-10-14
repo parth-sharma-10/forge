@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -441,6 +442,13 @@ func MaybeChild() {
 //     syscalls it denies — and after the command has been resolved, because
 //     that walks PATH and the filter has no reason to be in force for it.
 func child() error {
+	// The bounding set is per thread: PR_CAPBSET_DROP shrinks the calling
+	// thread's alone, and execve keeps the credentials of the thread that
+	// calls it. Go may move a goroutine to another OS thread at any call, so
+	// unpinned, the drop and the exec can land on different threads and the
+	// build gets the full bounding set. The thread is never unpinned: this
+	// process ends in the exec or an exit.
+	runtime.LockOSThread()
 	rootfs := os.Getenv(envRootfs)
 	if rootfs == "" {
 		return fmt.Errorf("sandbox: child: %s is not set", envRootfs)

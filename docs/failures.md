@@ -604,6 +604,26 @@ numbers in the README are from CI's runner for that reason, with the VM's
 given beside them as what a loaded machine looks like. If this failure
 recurs on a quiet machine it is a bug, and this entry is where it starts.
 
+**Resolved 2026-10-14: it was a bug, and load was only what exposed it.**
+`PR_CAPBSET_DROP` changes the bounding set of the calling thread only, and
+`execve` keeps the credentials of the thread that calls it. `child()` never
+pinned its goroutine, so Go could move it to another OS thread partway
+through `dropBoundingSet`. `0xbffffeff` is exactly what that produces: the
+drops of 0–29 landed on the first thread, and the exec'ing thread got only
+the tail of the loop (30, 32–40) and the final `CAP_SETPCAP`. The pattern
+"is not one a partial loop produces" was wrong. It is a partial loop, split
+across two threads.
+
+Reproduced on purpose: `forged` from `main` under three CPU hogs gave a wrong
+bounding set in 12 of 3,000 builds, 9 of them the full set. With
+`runtime.LockOSThread()` at the top of `child()` it gave 0 of 3,000.
+`TestTheBoundingSetHoldsUnderLoad` (1,000 builds, 8 at a time) fails every
+run without the pin and passes with it.
+
+**Lesson, revised.** A failure that only shows under load is a race until
+shown otherwise. "The machine was not fit to measure" was true of the
+benchmarks and was wrongly carried over to a correctness test.
+
 ## 2026-09-22 — Two packages' tests shared one database and truncated it under each other
 
 **Symptom.** Run locally with `FORGE_TEST_DSN` set, `go test -race ./internal/queue ./internal/worker`

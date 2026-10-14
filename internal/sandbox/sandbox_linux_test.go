@@ -1178,6 +1178,46 @@ func TestTheBoundingSetIsTheKeepList(t *testing.T) {
 	}
 }
 
+// TestTheBoundingSetHoldsUnderLoad runs many builds at once and checks every
+// one's bounding set. The drop is per thread, so a goroutine that migrates
+// between dropping and exec'ing hands the build an undropped set. One build
+// in a few hundred did, under load, before child() pinned its thread, and
+// some of them had the full set, CAP_SYS_ADMIN included. A single build
+// (TestTheBoundingSetIsTheKeepList) almost never shows it.
+func TestTheBoundingSetHoldsUnderLoad(t *testing.T) {
+	dir := rootfs(t)
+	const builds, parallel = 1000, 8
+	type outcome struct {
+		capBnd string
+		err    error
+	}
+	results := make(chan outcome, builds)
+	sem := make(chan struct{}, parallel)
+	for i := 0; i < builds; i++ {
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			var out bytes.Buffer
+			err := Run(context.Background(), Spec{Rootfs: dir, Args: []string{"/bin/grep", "CapBnd", "/proc/self/status"},
+				Stdout: &out, Stderr: &out})
+			results <- outcome{strings.TrimSpace(out.String()), err}
+		}()
+	}
+	bad := map[string]int{}
+	for i := 0; i < builds; i++ {
+		r := <-results
+		if r.err != nil {
+			t.Fatalf("run: %v (output %q)", r.err, r.capBnd)
+		}
+		if r.capBnd != "CapBnd:\t00000000800004fb" {
+			bad[r.capBnd]++
+		}
+	}
+	if len(bad) > 0 {
+		t.Fatalf("builds started with a bounding set other than the keep list: %v", bad)
+	}
+}
+
 // TestADroppedCapabilityIsGone is the behavioural half. A raw socket needs
 // CAP_NET_RAW in the user namespace that owns the network namespace, which
 // is this sandbox's own — so root here would ordinarily have it, and the
