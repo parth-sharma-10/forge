@@ -202,6 +202,10 @@ that is told how many bytes, rather than shown a splice. Every route,
 constant time; `forge-api` refuses to start without a token unless told
 `-insecure-no-auth`, for a proxy that authenticates in front of it.
 
+`GET /jobs/{id}/artifact` returns the tar of the job's `/out` once the job is
+done (`404` if it left none, `409` while it runs); `artifact_bytes` on the job
+says how big it is.
+
 `POST /jobs/{id}/cancel` finishes a queued job immediately (`200`). For a
 running job it answers `202`, and the worker's next heartbeat, at most two
 seconds later, kills the build and reports it `cancelled`. A job that has
@@ -321,8 +325,13 @@ the flag it has the kernel's default cap, half of RAM, and a job's memory limit
 is what stops it first. `-timeout` (an hour by default) kills a build that runs
 past it and reports it as `timeout`.
 
-Nothing a build writes survives the job. Artifacts come out on stdout or not
-at all until a later phase gives the worker a way to collect them.
+A build hands files back by leaving them in `/out`. The worker collects them
+as a tar of up to `-artifact-mb` (16 MiB by default; 0 turns collection off)
+and keeps the tar only for a build that exited, not for one that was killed.
+It is collected inside the sandbox after everything the build started has been
+killed: symlinks are recorded, never followed, and anything past the cap is
+left out and reported in the log ([docs/artifacts.md](docs/artifacts.md)).
+The tar is the build's output and should be extracted as untrusted input.
 
 The seccomp filter is an allowlist of syscall *numbers*, with one exception:
 `clone` is also checked for `CLONE_NEW*` flags, and refused with `EPERM` when

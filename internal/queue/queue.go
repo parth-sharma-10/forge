@@ -43,14 +43,17 @@ var ErrCancelled = errors.New("queue: job cancelled")
 // ErrDone is returned by Cancel for a job that has already finished.
 var ErrDone = errors.New("queue: job already done")
 
+// ErrNotDone is returned by Artifact for a job still queued or running.
+var ErrNotDone = errors.New("queue: job not done")
+
 // ReasonCancelled is the error a cancelled job is finished with, by Cancel
 // for a queued job or by the worker for a running one.
 const ReasonCancelled = "cancelled"
 
 // schema is applied by Open. CREATE IF NOT EXISTS rather than a migration
 // tool: there is one table, and the ALTERs at the end are the columns added
-// after it first existed (log_bytes in Phase 3, cancel_requested in v2),
-// each idempotent.
+// after it first existed (log_bytes in Phase 3, cancel_requested in v2,
+// artifact in v3), each idempotent.
 //
 // There is no attempt cap in the queue: the worker enforces -max-attempts
 // when it is handed a job past it (worker.run), so the row is finished and
@@ -76,6 +79,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_claimable ON jobs (id) WHERE state <> 'done';
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS log_bytes bigint NOT NULL DEFAULT 0;
 ALTER TABLE jobs ADD COLUMN IF NOT EXISTS cancel_requested boolean NOT NULL DEFAULT false;
+ALTER TABLE jobs ADD COLUMN IF NOT EXISTS artifact bytea;
 `
 
 // Queue is a handle on the jobs table. It is safe for concurrent use.
@@ -276,6 +280,11 @@ type Result struct {
 	Error string
 	// Log is the build's stdout and stderr, interleaved.
 	Log Log
+	// Artifact is the tar the build left in /out, or nil for none. Report
+	// stores it; Get leaves it out and says only how big it is
+	// (ArtifactBytes), since it can be megabytes. Artifact reads it.
+	Artifact      []byte
+	ArtifactBytes int64
 }
 
 // Report marks the job done with r. ErrLeaseLost means another worker holds
@@ -286,10 +295,10 @@ func (q *Queue) Report(ctx context.Context, job Job, r Result) error {
 	tag, err := q.db.Exec(ctx, `
 		UPDATE jobs
 		SET state = 'done', exit_code = $3, oom_killed = $4, error = $5,
-		    log = COALESCE($6, ''::bytea), log_bytes = $7,
+		    log = COALESCE($6, ''::bytea), log_bytes = $7, artifact = $8,
 		    finished_at = now(), lease_until = NULL
 		WHERE id = $1 AND fence = $2 AND state = 'running'`,
-		job.ID, job.Fence, r.ExitCode, r.OOMKilled, r.Error, r.Log.Tail, r.Log.Total)
+		job.ID, job.Fence, r.ExitCode, r.OOMKilled, r.Error, r.Log.Tail, r.Log.Total, r.Artifact)
 	if err != nil {
 		return fmt.Errorf("queue: report: %w", err)
 	}
@@ -337,10 +346,11 @@ func (q *Queue) Get(ctx context.Context, id int64) (Status, error) {
 	var s Status
 	var exit *int
 	err := q.db.QueryRow(ctx, `
-		SELECT state, attempt, worker, cancel_requested, exit_code, oom_killed, error, log, log_bytes
+		SELECT state, attempt, worker, cancel_requested, exit_code, oom_killed, error, log, log_bytes,
+		       COALESCE(octet_length(artifact), 0)
 		FROM jobs WHERE id = $1`, id).
 		Scan(&s.State, &s.Attempt, &s.Worker, &s.Cancelled, &exit, &s.Result.OOMKilled, &s.Result.Error,
-			&s.Result.Log.Tail, &s.Result.Log.Total)
+			&s.Result.Log.Tail, &s.Result.Log.Total, &s.Result.ArtifactBytes)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Status{}, ErrNotFound
 	}
@@ -352,6 +362,25 @@ func (q *Queue) Get(ctx context.Context, id int64) (Status, error) {
 		s.Result.ExitCode = *exit
 	}
 	return s, nil
+}
+
+// Artifact returns the tar a finished job handed back, or nil if it handed
+// back none. ErrNotDone for a job still queued or running, whose artifact
+// does not exist yet; ErrNotFound for one that was never submitted.
+func (q *Queue) Artifact(ctx context.Context, id int64) ([]byte, error) {
+	var state string
+	var art []byte
+	err := q.db.QueryRow(ctx, `SELECT state, artifact FROM jobs WHERE id = $1`, id).Scan(&state, &art)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("queue: artifact: %w", err)
+	}
+	if state != "done" {
+		return nil, ErrNotDone
+	}
+	return art, nil
 }
 
 // Summary is one job in a listing: its command and its state, without the log.
@@ -366,7 +395,8 @@ type Summary struct {
 // offset, so a job submitted between two pages does not shift the second one.
 func (q *Queue) List(ctx context.Context, state string, before int64, limit int) ([]Summary, error) {
 	rows, err := q.db.Query(ctx, `
-		SELECT id, args, state, attempt, worker, cancel_requested, exit_code, oom_killed, error, log_bytes
+		SELECT id, args, state, attempt, worker, cancel_requested, exit_code, oom_killed, error, log_bytes,
+		       COALESCE(octet_length(artifact), 0)
 		FROM jobs
 		WHERE ($1 = '' OR state = $1) AND ($2 = 0 OR id < $2)
 		ORDER BY id DESC
@@ -380,7 +410,7 @@ func (q *Queue) List(ctx context.Context, state string, before int64, limit int)
 		var j Summary
 		var exit *int
 		if err := rows.Scan(&j.ID, &j.Args, &j.State, &j.Attempt, &j.Worker, &j.Cancelled, &exit,
-			&j.Result.OOMKilled, &j.Result.Error, &j.Result.Log.Total); err != nil {
+			&j.Result.OOMKilled, &j.Result.Error, &j.Result.Log.Total, &j.Result.ArtifactBytes); err != nil {
 			return nil, fmt.Errorf("queue: list: %w", err)
 		}
 		j.Result.ExitCode = -1

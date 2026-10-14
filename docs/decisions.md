@@ -408,7 +408,8 @@ Rejected: a read-only bind of the image with tmpfs over `/tmp`, `/var/tmp` and
 `/etc` and `/lib/apk`, and a build platform that cannot install build
 dependencies is not one. Deferred, not rejected: an upper layer on a host
 directory that outlives the job, which is what collecting artifacts from the
-filesystem would want. Nothing collects them yet.
+filesystem would want. (Artifacts were built on 2026-10-14 without it: the
+walk runs inside the namespace before the layer dies.)
 
 **The image is shifted into the uid map.** The kernel will not copy a file up
 whose owner is not mapped in the writer's user namespace — `ovl_copy_up_one`
@@ -772,6 +773,42 @@ without running. A build that exits on its own in the same interval as the
 cancel keeps its own exit status: only a build the cancel actually killed is
 reported `cancelled`. A finished job cannot be cancelled (`409`), and its
 result stands.
+
+## 2026-10-14 — Artifacts come out through a supervisor PID 1, as a tar over a pipe
+
+The owner chose option B of [artifacts.md](artifacts.md). When a job collects
+artifacts, the child no longer execs the build over itself. It stays as PID 1,
+forks the build, reaps everything until the build exits, kills and reaps what
+is left, then writes a tar of `/out` to a pipe. The worker stores the tar in
+`jobs.artifact` and the API serves it.
+
+**Why the walk is inside the sandbox.** Walking an upper layer on the host
+would mean root code on the host handling an attacker-built tree: symlinks,
+FIFOs, whiteouts, sparse files, crash cleanup. Inside, the walk runs under
+the namespaces, the filter and the build's own capability set, and nothing is
+created on the host. Killing everything first removes every race between a
+check and an open.
+
+**Why the supervisor cuts its own capabilities.** The bounding set limits what
+an exec confers, not what the process holds. Without the `capset`, the
+supervisor would read the build's tree holding every capability of its user
+namespace. A non-dumpable flag keeps the build from ptracing it.
+
+**Why one byte before the archive.** PID 1 of a PID namespace cannot die of a
+signal it sends itself, and the build's signal has to reach the worker as a
+kill, not as an exit status a shell would print as 139. So the supervisor
+reports the signal and waits, and the parent SIGKILLs it. The alternative,
+exit codes of 128+n, would turn every OOM kill and segfault into an ordinary
+failure in the worker's accounting.
+
+**Rejected: per-job opt-in.** A field on `POST /jobs` and a column to carry
+it. The flag is per worker instead (`-artifact-mb`, default 16; 0 is the old
+sandbox exactly), because nothing yet needs two kinds of job on one worker.
+
+**Rejected: following the design's "the build is no longer PID 1" for every
+job.** The supervisor adds 4.4–7.9 MB resident and a fork to each job and puts a
+Go runtime's syscalls into the job's histogram. A worker that collects
+nothing should not pay for it.
 
 ## 2026-09-22 — A heartbeat writes the log only when it has grown
 

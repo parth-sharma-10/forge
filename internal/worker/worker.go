@@ -8,6 +8,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -43,6 +44,11 @@ type Worker struct {
 	// ScratchBytes caps each job's writable overlay layer and its inode count.
 	// Zero leaves it bounded only by the memory limit. Passed to sandbox.Spec.
 	ScratchBytes int64
+	// ArtifactBytes, if positive, collects each job's /out as a tar of at
+	// most this many bytes and reports it with the result. Zero collects
+	// nothing, and the build runs as PID 1 as it always did. See
+	// sandbox.Spec.Artifacts.
+	ArtifactBytes int64
 
 	// Lease is how long a claim holds without a heartbeat. Heartbeats go
 	// out every third of it or every two seconds, whichever is sooner —
@@ -270,7 +276,7 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		}
 	}()
 
-	err := w.Run(buildCtx, sandbox.Spec{
+	spec := sandbox.Spec{
 		Rootfs:       w.Rootfs,
 		Args:         job.Args,
 		Limits:       w.Limits,
@@ -279,7 +285,12 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		Observe:      w.Observe,
 		Stdout:       log,
 		Stderr:       log,
-	})
+	}
+	var artifact bytes.Buffer
+	if w.ArtifactBytes > 0 {
+		spec.Artifacts, spec.ArtifactBytes = &artifact, w.ArtifactBytes
+	}
+	err := w.Run(buildCtx, spec)
 	cancelBuild()
 	<-heartbeatDone
 	// A cgroup the sandbox could not remove is the host's problem, not the
@@ -298,6 +309,12 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 
 	r := result(err)
 	r.Log = log.Log()
+	// Only a build that exited with a status of its own hands back a
+	// complete archive; a killed one's is partial or empty. See
+	// sandbox.Spec.Artifacts.
+	if r.ExitCode >= 0 && artifact.Len() > 0 {
+		r.Artifact = artifact.Bytes()
+	}
 	out := outcome(r)
 	// A deadline on buildCtx is the timeout, and only the timeout: a lost
 	// lease or an operator's kill cancels the context, they do not expire it.

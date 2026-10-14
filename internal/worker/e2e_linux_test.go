@@ -3,8 +3,11 @@
 package worker
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -55,11 +58,18 @@ func TestEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	builder, err := q.Submit(ctx, []string{"/bin/sh", "-c", "mkdir /out && echo built > /out/result && exit 1"})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	w := &Worker{
 		Store: q, Name: "e2e", Rootfs: rootfs, CgroupRoot: cgroupRoot,
 		Limits: cgroup.Limits{MemoryBytes: 32 << 20, MaxPIDs: 64},
 		Lease:  2 * time.Second, Poll: 50 * time.Millisecond,
+		// Every job runs under the supervisor, so the OOM kill and the
+		// cancel below are its paths as well as the artifact.
+		ArtifactBytes: 1 << 20,
 	}
 	serveCtx, cancel := context.WithCancel(ctx)
 	stop, done := make(chan struct{}), make(chan struct{})
@@ -131,6 +141,28 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if !s.Cancelled || s.Result.ExitCode != -1 || s.Result.Error != queue.ReasonCancelled {
 		t.Errorf("cancelled sleeper: %+v, want cancelled with exit -1", s)
+	}
+
+	// A failed build's /out still comes back, as a tar, through the queue.
+	s = wait(builder)
+	if s.Result.ExitCode != 1 || s.Result.ArtifactBytes == 0 {
+		t.Errorf("builder: %+v, want exit 1 and an artifact", s.Result)
+	}
+	art, err := q.Artifact(ctx, builder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(bytes.NewReader(art))
+	if hdr, err := tr.Next(); err != nil || hdr.Name != "result" {
+		t.Fatalf("artifact's first entry: %v, %v; want result", hdr, err)
+	}
+	if body, _ := io.ReadAll(tr); string(body) != "built\n" {
+		t.Errorf("result = %q, want built", body)
+	}
+	for _, id := range []int64{hog, sleeper} {
+		if a, _ := q.Artifact(ctx, id); a != nil {
+			t.Errorf("job %d was killed and still reported an artifact", id)
+		}
 	}
 
 	close(stop)

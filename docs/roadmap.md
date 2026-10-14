@@ -81,7 +81,7 @@ and benchmark numbers — jobs per second per worker, sandbox setup latency
 ## Carried from the sandbox
 
 Named in [phase-1.md](phase-1.md): `/dev/ptmx` and `/dev/shm` when a build
-needs them; artifacts — nothing a build writes survives the job today, and
-the persistent upper layer Phase 1 rejected is where a later phase collects
-from. (`Run` discarding `group.Close()`'s error was fixed in v2: a cgroup
+needs them; artifacts, which were built on 2026-10-14 without the
+persistent upper layer Phase 1 rejected
+([artifacts.md](artifacts.md)). (`Run` discarding `group.Close()`'s error was fixed in v2: a cgroup
 left behind is now a `*CleanupError` and `forge_sandbox_cleanup_failures_total`.)

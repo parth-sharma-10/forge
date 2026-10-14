@@ -4,6 +4,7 @@ package sandbox
 
 import (
 	"context"
+	"io"
 	"testing"
 )
 
@@ -28,6 +29,20 @@ func BenchmarkRunWithLimits(b *testing.B) {
 		spec := Spec{Rootfs: dir, Args: []string{"/bin/true"}}
 		spec.Limits.MemoryBytes = 64 << 20
 		spec.Limits.MaxPIDs = 32
+		if err := Run(context.Background(), spec); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkRunSupervised is BenchmarkRun with artifacts collected: the build
+// runs under the supervisor, which forks it, reaps it, kills what is left and
+// walks an /out that does not exist. The difference from BenchmarkRun is the
+// supervisor's cost on a job that hands back nothing.
+func BenchmarkRunSupervised(b *testing.B) {
+	dir := benchRootfs(b)
+	for i := 0; i < b.N; i++ {
+		spec := Spec{Rootfs: dir, Args: []string{"/bin/true"}, Artifacts: io.Discard, ArtifactBytes: 16 << 20}
 		if err := Run(context.Background(), spec); err != nil {
 			b.Fatal(err)
 		}

@@ -5,6 +5,7 @@
 //	GET  /jobs?state=running&limit=50&before=7                 -> 200 {"jobs": [...], "next": 3}, newest first
 //	GET  /jobs/{id}                                            -> 200 job JSON, 404
 //	GET  /jobs/{id}/logs                                       -> 200 text/plain, streamed until the job is done
+//	GET  /jobs/{id}/artifact                                   -> 200 application/x-tar, 404 none, 409 not done yet
 //	POST /jobs/{id}/cancel                                     -> 200 done, 202 running (killed within a heartbeat), 404, 409 already done
 //	GET  /metrics                                              -> the queue's depth by state, Prometheus text format
 //
@@ -39,6 +40,7 @@ type Store interface {
 	Counts(ctx context.Context) (map[string]int64, error)
 	Cancel(ctx context.Context, id int64) (string, error)
 	List(ctx context.Context, state string, before int64, limit int) ([]queue.Summary, error)
+	Artifact(ctx context.Context, id int64) ([]byte, error)
 }
 
 // Listing bounds: a page is defaultPage jobs unless the caller asks for up to
@@ -73,6 +75,7 @@ func (s *server) routes() http.Handler {
 	mux.HandleFunc("GET /jobs/{id}", s.get)
 	mux.HandleFunc("GET /jobs/{id}/logs", s.logs)
 	mux.HandleFunc("POST /jobs/{id}/cancel", s.cancel)
+	mux.HandleFunc("GET /jobs/{id}/artifact", s.artifact)
 	var reg metrics.Registry
 	reg.Sampled("forge_queue_jobs", "Jobs in the queue, by state.", func() ([]metrics.Sample, error) {
 		counts, err := s.store.Counts(context.Background())
@@ -134,6 +137,9 @@ type Job struct {
 	// LogBytes is how much output the job has produced so far — more than
 	// /logs returns if the worker's tail limit was passed.
 	LogBytes int64 `json:"log_bytes"`
+	// ArtifactBytes is the size of the tar /artifact serves; zero when the
+	// job handed back nothing.
+	ArtifactBytes int64 `json:"artifact_bytes,omitempty"`
 }
 
 func (s *server) submit(w http.ResponseWriter, r *http.Request) {
@@ -176,7 +182,8 @@ func (s *server) get(w http.ResponseWriter, r *http.Request) {
 
 func wireJob(id int64, st queue.Status) Job {
 	j := Job{ID: id, State: st.State, Attempt: st.Attempt, Worker: st.Worker, CancelRequested: st.Cancelled,
-		OOMKilled: st.Result.OOMKilled, Error: st.Result.Error, LogBytes: st.Result.Log.Total}
+		OOMKilled: st.Result.OOMKilled, Error: st.Result.Error, LogBytes: st.Result.Log.Total,
+		ArtifactBytes: st.Result.ArtifactBytes}
 	if st.State == "done" {
 		code := st.Result.ExitCode
 		j.ExitCode = &code
@@ -299,6 +306,34 @@ func (s *server) cancel(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"id": id, "state": state})
 	default:
 		writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "state": state})
+	}
+}
+
+// artifact serves the tar a finished job left in /out. It is the build's
+// output, so it is served as an attachment that a browser will not render,
+// and a client that extracts it must treat it as hostile: names may be
+// absolute or climb with "..", and symlinks may point anywhere.
+func (s *server) artifact(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		http.Error(w, "job id must be a number", http.StatusBadRequest)
+		return
+	}
+	art, err := s.store.Artifact(r.Context(), id)
+	switch {
+	case errors.Is(err, queue.ErrNotFound):
+		http.Error(w, "no such job", http.StatusNotFound)
+	case errors.Is(err, queue.ErrNotDone):
+		http.Error(w, "job not done: its artifact does not exist yet", http.StatusConflict)
+	case err != nil:
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	case art == nil:
+		http.Error(w, "the job handed back no artifact", http.StatusNotFound)
+	default:
+		w.Header().Set("Content-Type", "application/x-tar")
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="job-%d.tar"`, id))
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Write(art)
 	}
 }
 

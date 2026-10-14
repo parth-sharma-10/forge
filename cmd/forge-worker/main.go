@@ -43,6 +43,7 @@ func main() {
 		cpuCores       = flag.Float64("cpu", 0, "CPU limit per job in cores (0 for unlimited)")
 		maxPIDs        = flag.Int("pids", 0, "maximum processes per job (0 for unlimited)")
 		diskMB         = flag.Int64("disk-mb", 0, "writable-layer (disk + inode) limit per job in MiB (0 for unlimited)")
+		artifactMB     = flag.Int64("artifact-mb", 16, "collect each job's /out as a tar of up to this many MiB (0 collects nothing)")
 		cgroupRoot     = flag.String("cgroup-root", cgroup.DefaultRoot, "parent cgroup for the jobs' cgroups")
 		metricsAt      = flag.String("metrics", "", "address to serve /metrics on (empty for none)")
 		retain         = flag.Duration("retain", 0, "delete finished jobs this long after they finish; 0 keeps them forever")
@@ -96,8 +97,8 @@ func main() {
 	w := &worker.Worker{
 		Store: q, Name: *name, Rootfs: *rootfs, CgroupRoot: *cgroupRoot,
 		Limits:       cgroup.Limits{MemoryBytes: *memoryMB << 20, CPUCores: *cpuCores, MaxPIDs: *maxPIDs},
-		ScratchBytes: *diskMB << 20,
-		Lease:        *lease, Poll: *poll, MaxAttempts: *attempts, Timeout: *timeout, Log: log, Metrics: &reg,
+		ScratchBytes: *diskMB << 20, ArtifactBytes: *artifactMB << 20,
+		Lease: *lease, Poll: *poll, MaxAttempts: *attempts, Timeout: *timeout, Log: log, Metrics: &reg,
 	}
 
 	if *syscallMetrics {

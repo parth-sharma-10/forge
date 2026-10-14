@@ -67,8 +67,13 @@ rootfs:
 ## test-sandbox: the Linux-only isolation tests, as root (Linux hosts and CI)
 # The test binary is built and then run under sudo, rather than running
 # `sudo go test`: root has a different GOCACHE and would rebuild the world.
+#
+# The sandbox test binary is built without cgo: some tests copy it into the
+# Alpine image and run it there as the build, and a binary linked against the
+# host's glibc has no loader to start in a musl image (execve says ENOENT).
+# archive/tar imports os/user, which links libc whenever cgo is on.
 test-sandbox: rootfs
-	$(GO) test -c -o /tmp/forge-sandbox.test ./internal/sandbox
+	CGO_ENABLED=0 $(GO) test -c -o /tmp/forge-sandbox.test ./internal/sandbox
 	$(GO) test -c -o /tmp/forge-cgroup.test ./internal/cgroup
 	$(GO) test -c -o /tmp/forge-worker.test ./internal/worker
 	sudo FORGE_TEST_ROOTFS=$(ROOTFS) /tmp/forge-sandbox.test -test.v -test.count=1

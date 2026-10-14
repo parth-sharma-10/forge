@@ -81,6 +81,9 @@ const (
 	// envPreflight makes the child build the whole sandbox and exit 0 in
 	// place of exec'ing anything. See Preflight.
 	envPreflight = "FORGE_SANDBOX_PREFLIGHT"
+	// envArtifactBytes, set, runs the build under a supervisor that hands
+	// back ArtifactDir. See Spec.Artifacts.
+	envArtifactBytes = "FORGE_SANDBOX_ARTIFACT_BYTES"
 
 	defaultHostname = "forge"
 )
@@ -128,6 +131,23 @@ type Spec struct {
 	// Observe disables it entirely.
 	Observe func(cgroupID uint64) (done func())
 
+	// Artifacts, if non-nil, receives a tar of ArtifactDir as the build left
+	// it, of at most ArtifactBytes, which must then be positive. The build
+	// runs under a supervisor of Forge's own that is PID 1 in its place,
+	// waits for it, kills everything else in the sandbox and only then reads
+	// the directory (supervise). What was left out — entries past the cap,
+	// sockets, FIFOs — is reported on Stderr.
+	//
+	// The archive is complete only for a build that exited with a status of
+	// its own: Run returned nil, or an *exec.ExitError whose ExitCode is not
+	// -1. A build killed by a signal, by the context or by the memory limit
+	// hands back nothing, or a partial archive to be discarded.
+	//
+	// The tar is the build's: a consumer that extracts it must treat it as
+	// hostile — absolute names, "..", and symlinks pointing anywhere.
+	Artifacts     io.Writer
+	ArtifactBytes int64
+
 	Stdin  io.Reader
 	Stdout io.Writer
 	Stderr io.Writer
@@ -151,6 +171,9 @@ func (s *Spec) validate() error {
 	}
 	if !fi.IsDir() {
 		return fmt.Errorf("sandbox: rootfs %q is not a directory", s.Rootfs)
+	}
+	if s.Artifacts != nil && s.ArtifactBytes <= 0 {
+		return errors.New("sandbox: spec collects artifacts with no ArtifactBytes cap")
 	}
 	if s.Hostname == "" {
 		s.Hostname = defaultHostname
