@@ -24,7 +24,7 @@ adds no product surface — it adds evidence.
 |---|---|---|
 | Seccomp fuzzer | filter fuzzed against an independent policy oracle; the interpreter grounded on the real kernel | done — [seccomp-fuzzer.md](seccomp-fuzzer.md) (PR #17, merged) |
 | Threat model + isolation tests | per-boundary control→code→test table; what Forge does *not* defend; fd-leak (CVE-2024-21626 class) and clean-environment tests | done — [threat-model.md](threat-model.md) (PR #18) |
-| runc CVE-2024-21626 repro | Forge-side non-vulnerability tested; upstream reproduction planned | Forge half done; upstream deferred — [cve-2024-21626.md](cve-2024-21626.md) (needs a disposable host) |
+| runc CVE-2024-21626 repro | Forge-side non-vulnerability tested; upstream reproduction planned | Forge half done; upstream deferred — [cve-2024-21626.md](cve-2024-21626.md) (disposable VM available; the vulnerable-runc setup is disproportionate to its value over the Forge-side test) |
 | eBPF syscall observability | per-job syscall histograms, non-intrusive, degrading gracefully | done — [observability-ebpf.md](observability-ebpf.md) |
 | Hardening pass | bearer-token API auth (default deny), wall-clock job timeout, per-job disk + inode cap, cgroup namespace | done — [threat-model.md](threat-model.md) boundaries 16–18 (PR #20) |
 | GPU passthrough (v3) | GPU-capable sandbox, isolation trade-offs made explicit | analysed, deferred — [gpu-forge-v3.md](gpu-forge-v3.md) (needs hardware + an isolation decision) |
