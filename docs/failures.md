@@ -93,6 +93,13 @@ the code. The unit tests all passed both before and after; only wall-clock
 timestamps from a real signal exposed it. `TestCloseReleasesParkedSubmit` now
 asserts the timing, and fails against the old implementation.
 
+**2026-11-06 — `internal/pool` removed.** This entry and the previous one are
+about the pool, which nothing used once the worker became N loops
+(decisions.md, 2026-09-16) and which was deleted after Phase 5 found no use for
+it. Both entries stand as written. The code they cite, `pool.go:129` and the
+tests `TestConcurrentSubmitAndClose` and `TestCloseReleasesParkedSubmit`, is
+in history: `git show f8ac9fc:internal/pool/pool.go`.
+
 ---
 
 ## 2026-09-09 — A rootfs symlink that is dangling right up until pivot_root

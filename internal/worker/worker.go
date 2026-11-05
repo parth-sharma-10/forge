@@ -1,10 +1,10 @@
 // Package worker is the job loop: claim a job, run it in the sandbox while
 // keeping its lease alive, report what happened, repeat.
 //
-// Two stops, as with the pool: drain finishes the job in hand and claims no
-// more; cancel kills the job in hand. They are different signals because an
-// operator restarting a worker wants the first and an operator whose worker
-// is wedged wants the second.
+// Two stops: drain finishes the job in hand and claims no more; cancel kills
+// the job in hand. They are different signals because an operator restarting
+// a worker wants the first and an operator whose worker is wedged wants the
+// second.
 package worker
 
 import (
