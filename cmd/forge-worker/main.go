@@ -115,9 +115,7 @@ func main() {
 	}
 	// Build one sandbox before claiming anything: a worker that cannot would
 	// otherwise take every job in the queue and report each a setup failure.
-	if err := sandbox.Preflight(ctx, sandbox.Spec{
-		Rootfs: w.Rootfs, Limits: w.Limits, CgroupRoot: w.CgroupRoot, ScratchBytes: w.ScratchBytes,
-	}); err != nil {
+	if err := w.Preflight(ctx); err != nil {
 		log.Error("this host cannot run builds; refusing to claim jobs", "err", err)
 		os.Exit(1)
 	}

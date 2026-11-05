@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os/exec"
 	"sync"
@@ -97,6 +98,37 @@ const (
 	defaultMaxAttempts = 3
 	maxFlush           = 2 * time.Second
 )
+
+// Preflight builds one sandbox from the worker's configuration and runs
+// nothing in it. See sandbox.Preflight.
+func (w *Worker) Preflight(ctx context.Context) error {
+	return sandbox.Preflight(ctx, w.preflightSpec())
+}
+
+// preflightSpec collects artifacts into io.Discard when jobs collect them, so
+// preflight takes the supervisor path a job does; the child exits before
+// writing anything, so nothing is buffered.
+func (w *Worker) preflightSpec() sandbox.Spec {
+	return w.sandboxSpec(io.Discard)
+}
+
+// sandboxSpec is everything in a job's sandbox.Spec that comes from the
+// worker's configuration rather than the job. It is the one place both a job
+// and preflight get it from, so preflight builds the sandbox a job gets.
+// artifacts receives the job's archive when the worker collects one.
+func (w *Worker) sandboxSpec(artifacts io.Writer) sandbox.Spec {
+	spec := sandbox.Spec{
+		Rootfs:       w.Rootfs,
+		Limits:       w.Limits,
+		CgroupRoot:   w.CgroupRoot,
+		ScratchBytes: w.ScratchBytes,
+		Observe:      w.Observe,
+	}
+	if w.ArtifactBytes > 0 {
+		spec.Artifacts, spec.ArtifactBytes = artifacts, w.ArtifactBytes
+	}
+	return spec
+}
 
 func (w *Worker) heartbeatEvery() time.Duration {
 	return min(w.Lease/3, maxFlush)
@@ -276,20 +308,9 @@ func (w *Worker) run(ctx context.Context, job queue.Job) {
 		}
 	}()
 
-	spec := sandbox.Spec{
-		Rootfs:       w.Rootfs,
-		Args:         job.Args,
-		Limits:       w.Limits,
-		CgroupRoot:   w.CgroupRoot,
-		ScratchBytes: w.ScratchBytes,
-		Observe:      w.Observe,
-		Stdout:       log,
-		Stderr:       log,
-	}
 	var artifact bytes.Buffer
-	if w.ArtifactBytes > 0 {
-		spec.Artifacts, spec.ArtifactBytes = &artifact, w.ArtifactBytes
-	}
+	spec := w.sandboxSpec(&artifact)
+	spec.Args, spec.Stdout, spec.Stderr = job.Args, log, log
 	err := w.Run(buildCtx, spec)
 	cancelBuild()
 	<-heartbeatDone
