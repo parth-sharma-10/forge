@@ -834,3 +834,16 @@ Rejected: append-only log chunks in their own table. That removes the rewrite
 of a *growing* tail as well, but it adds a table, a join and a retention path.
 Revisit if a chatty build's rewrite of a changing tail shows up in a
 measurement.
+
+## 2026-11-06 — The pool goes, as 2026-09-16 said it would
+
+The 2026-09-16 entry kept `internal/pool` "for now; if Phase 5 finds nothing
+using it, it goes". All five phases are complete and nothing imports it: `go
+list` shows no importer, and the Makefile, CI and `hack/` never named it. It
+is deleted, with its README row and its architecture.md section. The two
+failures.md entries about it stand as written, with a note pointing at the
+code in history (`git show f8ac9fc:internal/pool/pool.go`).
+
+Rejected: keeping it as a worked example of a safe channel close. The
+failures.md entries carry the reasoning and the history carries the code,
+and a package nothing runs is one more thing to keep compiling and testing.
