@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<title>Forge console</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+<header class="titleblock">
+  <div class="cell device"><h1>Forge job queue</h1></div>
+  <div class="cell"><span class="label">Queued</span><span class="count" id="count-queued">–</span></div>
+  <div class="cell"><span class="label">Running</span><span class="count" id="count-running">–</span></div>
+  <div class="cell"><span class="label">Done</span><span class="count" id="count-done">–</span></div>
+  <div class="cell token"><span class="label">Token</span>
+    <span id="token-state">not set</span>
+    <button type="button" id="forget" class="link" hidden>Forget token</button>
+  </div>
+</header>
+
+<main>
+  <p id="status" class="status" role="status" aria-live="polite"></p>
+
+  <form id="token-form" class="panel" hidden>
+    <label for="token">API token</label>
+    <p class="hint">The API refused this request. Enter its bearer token; it is kept for this tab only and sent in a header, never in a URL.</p>
+    <div class="row">
+      <input id="token" type="password" autocomplete="off" spellcheck="false" required>
+      <button type="submit" class="primary">Use token</button>
+    </div>
+  </form>
+
+  <section aria-labelledby="t1">
+    <div class="caption-row">
+      <h2 id="t1">Table 1. Jobs, newest first <span id="span" class="span"></span></h2>
+      <div class="tools">
+        <div class="seg" role="group" aria-label="Filter by state">
+          <button type="button" data-state="" aria-pressed="true">All</button>
+          <button type="button" data-state="queued" aria-pressed="false">Queued</button>
+          <button type="button" data-state="running" aria-pressed="false">Running</button>
+          <button type="button" data-state="done" aria-pressed="false">Done</button>
+        </div>
+        <button type="button" id="open-submit" class="primary" aria-expanded="false" aria-controls="submit-form">Submit job</button>
+      </div>
+    </div>
+
+    <form id="submit-form" class="panel" hidden>
+      <label for="command">Shell command</label>
+      <textarea id="command" rows="3" spellcheck="false" required placeholder="make build"></textarea>
+      <p class="hint">Sent as these arguments, exactly:</p>
+      <pre id="args-preview" class="args"></pre>
+      <p id="submit-error" class="error" role="alert"></p>
+      <div class="row">
+        <button type="submit" class="primary">Submit</button>
+        <button type="button" id="close-submit">Cancel</button>
+      </div>
+    </form>
+
+    <div class="scroll">
+      <table class="jobs">
+        <thead>
+          <tr><th scope="col">Job</th><th scope="col">State</th><th scope="col" class="wide">Command</th>
+            <th scope="col" class="n">Exit</th><th scope="col" class="n opt-narrow">Attempt</th><th scope="col" class="opt">Worker</th>
+            <th scope="col" class="n opt">Log</th><th scope="col" class="n opt">Artifact</th></tr>
+          <tr class="units" aria-hidden="true"><td></td><td></td><td></td><td class="n">code</td><td class="n opt-narrow">n</td>
+            <td class="opt"></td><td class="n opt">bytes</td><td class="n opt">bytes</td></tr>
+        </thead>
+        <tbody id="jobs"></tbody>
+      </table>
+    </div>
+    <p id="empty" class="empty" hidden></p>
+    <nav class="pager" aria-label="Pages">
+      <button type="button" id="newer" disabled>Newer</button>
+      <button type="button" id="older" disabled>Older</button>
+    </nav>
+  </section>
+
+  <section id="detail" aria-labelledby="t2" hidden>
+    <div class="caption-row">
+      <h2 id="t2">Table 2. Job <span id="d-id"></span></h2>
+      <div class="tools">
+        <button type="button" id="cancel">Cancel job</button>
+        <button type="button" id="download" class="primary" hidden>Download artifact</button>
+        <button type="button" id="close-detail">Close</button>
+      </div>
+    </div>
+    <p id="detail-status" class="status" role="status" aria-live="polite"></p>
+    <div class="detail-body">
+      <div class="scroll">
+        <table class="props">
+          <thead><tr><th scope="col">Parameter</th><th scope="col">Value</th><th scope="col">Unit</th></tr></thead>
+          <tbody id="props"></tbody>
+        </table>
+      </div>
+      <div class="output">
+        <h3>Output <span id="log-state" class="span"></span></h3>
+        <pre id="log" class="log" role="log" tabindex="0" aria-label="Job output"></pre>
+      </div>
+    </div>
+  </section>
+</main>
+</body>
+</html>

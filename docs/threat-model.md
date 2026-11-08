@@ -19,14 +19,44 @@ layer by every job on the host. A build cannot modify it (that is deliberate
 and tested), but a malicious *image* is outside the model — it would be the
 operator attacking themselves.
 
-**A caller holding the API token is trusted to submit builds.** Every route
-wants `Authorization: Bearer <token>`, compared in constant time, and
+**A caller holding the API token is trusted to submit builds.** Every data
+route wants `Authorization: Bearer <token>`, compared in constant time, and
 `forge-api` will not start without a token unless the operator passes
 `-insecure-no-auth` for a proxy that authenticates in front
 (`internal/api/api.go`, `cmd/forge-api`). A caller *without* the token is
 refused; a caller with it can run any build, which is the point of the API. The
 adversary modelled below is the build itself, and it starts *after* a job is
 accepted.
+
+**The console's three files are the only thing served without the token.**
+`GET /ui/`, `/ui/app.js` and `/ui/style.css` are fixed files compiled into the
+binary, never templated, holding no job data; `GET /` redirects to `/ui/`.
+They have to load without a header because a browser's page load cannot send
+one. Every job, log, artifact and metric the page shows it fetches from the
+data routes with the token, like any other client, and any other path under
+`/ui/` is a 404. `TestDataRoutesStillNeedToken` and
+`TestPathTricksDoNotBypassAuth` (dot segments, encoded and doubled slashes,
+backslashes, case) prove the data routes did not move;
+`TestConsoleAssetsCarryNoJobData` proves the files are the same bytes whatever
+the queue holds.
+
+The console puts a hostile build's output in front of a browser that holds the
+token, so it is a second place the build can attack. Every API value is
+written to the page as text, never parsed as HTML (`TestConsoleScriptHasNoHTMLSinks`
+is a static guard over the script); the page is served with a CSP that allows
+script, style and requests from its own origin only, no inline script and no
+framing, plus `nosniff` and `Referrer-Policy: no-referrer`
+(`TestConsoleLoadsWithoutToken`). The token is kept in the tab's
+`sessionStorage` and sent only in the header: no cookie, so no CSRF surface,
+and never in a URL. The artifact is fetched with the header and saved from a
+blob, so the browser never renders it. The client side has no automated test
+in this repo; it was checked by hand, in Chrome with a clean profile against a
+live API and worker, and the results are recorded in the console's PR: a job
+printing `<script>`, `<img onerror>` and `</pre><svg onload>` renders as
+literal text, no dialog opens, and a script injected into the running page is
+refused by the CSP. The API's own `[forge: ...]` log markers share the byte
+stream with the build's output, so a build can print a forged one; the console
+renders every line the same, as text.
 
 ### Assets, in the order losing them hurts
 
