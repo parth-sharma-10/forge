@@ -76,7 +76,7 @@ func TestAuthRejectsAndAdmits(t *testing.T) {
 // just submission.
 func TestAuthGuardsEveryRoute(t *testing.T) {
 	srv, _ := authedServer(t, "s3cret")
-	for _, path := range []string{"/jobs", "/jobs/1", "/jobs/1/logs", "/metrics"} {
+	for _, path := range []string{"/jobs", "/jobs/1", "/jobs/1/logs", "/jobs/1/artifact", "/metrics"} {
 		resp := do(t, "GET", srv.URL+path, "", "")
 		resp.Body.Close()
 		if resp.StatusCode != http.StatusUnauthorized {

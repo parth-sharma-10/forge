@@ -9,8 +9,14 @@
 //	POST /jobs/{id}/cancel                                     -> 200 done, 202 running (killed within a heartbeat), 404, 409 already done
 //	GET  /metrics                                              -> the queue's depth by state, Prometheus text format
 //
-// Authentication is a static bearer token, applied to every route including
-// /metrics: a request must carry `Authorization: Bearer <token>`. It is the
+//	GET  /ui/                                                  -> the console (console.go), no token: fixed files, no job data
+//	GET  /                                                     -> 302 to /ui/
+//
+// Authentication is a static bearer token, applied to every data route
+// including /metrics: a request must carry `Authorization: Bearer <token>`.
+// The console's three static files are the one exception, because a browser
+// page load cannot send the header; they hold no job data, and the page
+// fetches everything it shows from the data routes with the token. It is the
 // simplest thing that is a real boundary — one shared secret, compared in
 // constant time — for the trusted/internal deployment Forge targets, not a
 // user/role system. A deployment that terminates auth in a proxy in front can
@@ -89,7 +95,14 @@ func (s *server) routes() http.Handler {
 		return out, nil
 	})
 	mux.Handle("GET /metrics", &reg)
-	return s.authenticated(mux)
+
+	// The console's assets are the one thing outside the token check; every
+	// other path, known or not, goes through it.
+	top := http.NewServeMux()
+	top.HandleFunc("GET /ui/", serveConsole)
+	top.Handle("GET /{$}", http.RedirectHandler("/ui/", http.StatusFound))
+	top.Handle("/", s.authenticated(mux))
+	return top
 }
 
 // authenticated rejects any request without the bearer token. With no token
