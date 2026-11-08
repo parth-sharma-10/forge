@@ -144,7 +144,7 @@ fuzz:
 
 ## bench: sandbox setup latency and jobs per second (Linux, root, image, database)
 # The test binaries from test-sandbox, run for their benchmarks only. The
-# numbers in the README come from vm-bench on the machine it names.
+# numbers in the README come from this target's step in CI, on the runner it names.
 BENCH_ARGS = -test.run '^$$' -test.bench . -test.benchtime 20x -test.count=1
 bench: rootfs
 	$(GO) test -c -o /tmp/forge-sandbox.test ./internal/sandbox
