@@ -14,7 +14,7 @@ one is not done.
 
 | Deliverable | Proven by |
 |---|---|
-| Bounded worker pool; drain and cancel are different shutdowns | `make test` — `internal/pool`, 11 tests, race detector on |
+| Bounded worker pool; drain and cancel are different shutdowns | `make test` — `internal/pool`, 11 tests, race detector on (package removed 2026-11-06, see decisions.md; code at `git show f8ac9fc:internal/pool`) |
 | Fresh mount, PID, UTS, IPC, net and user namespaces per job; `pivot_root` with the old root detached | `TestEveryNamespaceIsNew`, `TestHostFilesystemIsUnreachable`, `TestMountsDoNotLeakToHost`, `TestCommandRunsAsPIDOne` |
 | A `/dev` of six bind-mounted nodes and four symlinks, nothing else | `TestDevIsOnlyTheMinimalSet`, `TestDevNodesBehaveLikeTheirKernelDevices` |
 | cgroups v2 memory, cpu and pids limits, applied at clone time; an OOM kill is reported as one | `internal/cgroup`, `TestMemoryLimitIsReportedAsAnOOMKill`, `TestSandboxRunsInsideItsOwnCgroup` |

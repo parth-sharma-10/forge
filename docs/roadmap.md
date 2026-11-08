@@ -49,7 +49,7 @@ Once decided, Phase 2 is:
 1. `internal/queue`: the schema (`jobs`, `runs`, `leases`), `Claim`,
    `Heartbeat`, `Report`, each a single transaction; tested against a real
    PostgreSQL in CI (`services:` in the workflow), never a mock.
-2. `forge-worker` becomes real: a `pool.Pool` of job loops, each claiming,
+2. `forge-worker` becomes real: N job loops (planned as a `pool.Pool`; built as plain loops), each claiming,
    running `sandbox.Run`, heartbeating on a ticker, reporting the exit
    status and the OOM distinction the sandbox already makes.
 3. Logs: captured to the run row (bounded) — streaming is Phase 3's.
