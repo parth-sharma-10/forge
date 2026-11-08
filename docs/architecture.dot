@@ -1,0 +1,28 @@
+// Forge architecture. Render with: dot -Tsvg docs/architecture.dot -o docs/architecture.svg
+digraph forge {
+  graph [rankdir=LR, bgcolor="white", fontname="Helvetica", fontsize=11, nodesep=0.4, ranksep=0.45, pad=0.2];
+  node  [shape=box, style="rounded,filled", fillcolor="#f4f5f7", color="#5b6270", fontname="Helvetica", fontsize=11, margin="0.15,0.08"];
+  edge  [color="#5b6270", fontname="Helvetica", fontsize=9, fontcolor="#3a3f46"];
+
+  client [label="client\ncurl, or the\nconsole at /ui/"];
+  api    [label="forge-api\nbearer token on\nevery data route\nno privileges"];
+  pg     [label="PostgreSQL\njobs table\nSKIP LOCKED claims\nleases, fencing tokens", shape=cylinder];
+  worker [label="forge-worker × N\nclaim, heartbeat,\nreport"];
+  sandbox [label=<
+    <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="1">
+      <TR><TD><B>sandbox, one per job</B></TD></TR>
+      <TR><TD ALIGN="LEFT">user namespace: root inside is uid 524288 outside</TD></TR>
+      <TR><TD ALIGN="LEFT">mount ns: overlay on tmpfs, pivot_root, private /dev</TD></TR>
+      <TR><TD ALIGN="LEFT">pid, net, ipc, uts, cgroup namespaces</TD></TR>
+      <TR><TD ALIGN="LEFT">cgroup v2 per job: memory, cpu, pids</TD></TR>
+      <TR><TD ALIGN="LEFT">capability bounding set cut to nine</TD></TR>
+      <TR><TD ALIGN="LEFT">seccomp allowlist: 192 syscalls amd64, 159 arm64</TD></TR>
+      <TR><TD ALIGN="LEFT"><I>then exec the build</I></TD></TR>
+    </TABLE>>, fillcolor="#fff6e5", color="#e3a33b"];
+
+  client -> api    [label="HTTP"];
+  api    -> pg     [label="submit, read,\ncancel"];
+  pg     -> worker [label="claim / report", dir=both];
+  worker -> sandbox [label="clone"];
+  sandbox -> worker [label="exit, log,\n/out tar", style=dashed];
+}
