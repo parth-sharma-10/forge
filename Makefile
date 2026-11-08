@@ -26,7 +26,7 @@ VM_WORKER_BIN = $(HOME)/.cache/forge/worker.test
 FORGE_TEST_DSN ?=
 VM_DSN ?= postgres://forge:forge@127.0.0.1:5432/forge
 
-.PHONY: all test fmt vet race build clean rootfs test-sandbox test-syscalls vm-test vm-shell mutate mutate-queue fuzz bench vm-bench verify-units
+.PHONY: all test fmt vet race build clean rootfs test-sandbox test-syscalls vm-test vm-shell mutate mutate-queue vm-mutate-queue fuzz bench vm-bench verify-units
 
 all: test
 
@@ -126,11 +126,15 @@ vm-shell:
 # Runs inside the VM like vm-test. Exits non-zero on any mutation the suite
 # still passes; the score in docs/phase-0.md comes from this and nowhere else.
 mutate:
-	VM=$(VM) FORGE_TEST_ROOTFS=$(ROOTFS) hack/mutate.py
+	VM="$(VM)" FORGE_TEST_ROOTFS=$(ROOTFS) hack/mutate.py
 
 ## mutate-queue: the same for the queue, on the host, against FORGE_TEST_DSN
 mutate-queue:
 	FORGE_TEST_DSN=$(FORGE_TEST_DSN) hack/mutate.py --queue
+
+## vm-mutate-queue: the same, inside the VM against VM_DSN, where tests and database share a clock
+vm-mutate-queue:
+	VM="$(VM)" VM_DSN=$(VM_DSN) FORGE_TEST_ROOTFS=$(ROOTFS) hack/mutate.py --queue-vm
 
 ## fuzz: explore the seccomp filter against its policy oracle (Linux, Go, no root)
 # The fuzz target is pure functions — the filter and the evaluate interpreter —

@@ -656,3 +656,67 @@ five passes.
 **Lesson.** A test's isolation boundary is the state it shares, not its
 package. Test helpers that reset shared state need a lock that is as wide as
 the state they reset.
+
+## 2026-11-08 — Three mutants had not run since September, and one hung for two hours
+
+**Problem.** `make mutate` on `main` scored 24/24 and exited 2. Three mutants
+were harness errors: `unlisted-syscalls-allowed` no longer compiled, and
+`no-overlay-image-bound-directly` and `lower-is-cwd-not-image` matched nothing.
+`no-user-namespace` ran for 2 h 11 min before it was killed by hand, and was
+then printed as "suite passed". The README said 27 mutations apply.
+
+**Root cause.** Four separate ones:
+
+- **The code moved under the patterns.** `mountOverlay` gained a
+  `scratchBytes` argument in 77e8a65 (2026-09-22). Its `Chdir` block now
+  appears twice in the file.
+- **A test made a mutant uncompilable.** f253dcc (2026-09-20) added a
+  `switch got { case denyAction: … case retAllow: … }`. When the mutant makes
+  the two constants equal, that is a duplicate case, so the test package no
+  longer builds.
+- **The fork deadlock moved out of Go's reach.** The test binary's main
+  thread sits in `clone3` in `D` state, waiting on a child that is blocked
+  reading a pipe from it. Go's `-test.timeout` never fired, and the harness
+  had no deadline of its own.
+- **The label was wrong.** A non-zero exit with no failing test was labelled
+  "suite passed".
+
+The harness exits non-zero on a harness error, so none of this was hidden.
+No run of `make mutate` is recorded between those commits and today, and none
+runs in CI.
+
+**A fifth problem appeared while fixing these.** Once the overlay mutant ran
+again, it wrote straight into the shared image: thousands of the inode test's
+files and an `/out`. The mutant after it, `lower-is-cwd-not-image`, would have
+been scored on that damage. This is the same trap as the `no-overlay` →
+`no-userxattr` pair on 2026-09-16. The damaged image is kept aside as
+`/var/tmp/forge-rootfs.poisoned-20261108` in the VM, and a fresh one was
+unpacked from the pinned tarball.
+
+**Fix.**
+
+- The two patterns follow the current code.
+- The test's switch is tagless, which behaves identically on the real code.
+- Every VM run gets a private `cp -a` copy of the image, deleted afterwards.
+- Every VM run has an outer deadline (its test timeouts plus 120 s). Past it,
+  the run's processes are killed in the VM and the run is scored as hung,
+  but only if a check afterwards finds no survivor and no leftover image.
+  Otherwise it is a harness error.
+- The unmutated suite runs first, and nothing is scored if it fails. A
+  non-zero exit with no failing test and no hang is a harness error, not a
+  catch, so an unreachable VM or a wrong `VM_DSN` can no longer print a
+  perfect score. Both were tried, and both stop at the baseline.
+- `make vm-mutate-queue` runs the queue mutants inside the VM. From macOS the
+  host's port 5432 was another PostgreSQL, and a tunnel to the VM's database
+  failed `TestSubmitClaimReport`'s lease tolerance on clock skew alone
+  (1m0.027s against "about a minute").
+- `VM` may now be a command with arguments.
+
+Results: 27/27 sandbox mutants (`no-user-namespace` by the outer deadline) and
+8/8 queue mutants caught. The shared image was unchanged afterwards.
+
+**Lesson.** A mutation score is a claim about the code, the tests *and* the
+harness at one commit. A harness that is not run goes stale silently, even
+when it reports its own errors honestly. Run it whenever the code it patches
+changes shape, and give it its own deadline, because a test's deadline cannot
+interrupt the kernel.
