@@ -94,7 +94,7 @@ make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside a colima VM (VM='colima -p <profile>')
 make mutate        # break the sandbox 27 ways and check a test notices each
 make mutate-queue  # break the queue 8 ways, against FORGE_TEST_DSN (Linux host)
-make vm-mutate-queue # the same, inside the colima VM, against its PostgreSQL
+make vm-mutate-queue # the queue's 8 inside the colima VM; the worker suite runs as root there
 make fuzz          # fuzz the seccomp filter against its policy (Linux, no root)
 make test-syscalls # the eBPF syscall-count test (Linux, root)
 make bench         # sandbox setup latency and jobs per second (Linux, root)

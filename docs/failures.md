@@ -698,9 +698,14 @@ unpacked from the pinned tarball.
 - The two patterns follow the current code.
 - The test's switch is tagless, which behaves identically on the real code.
 - Every VM run gets a private `cp -a` copy of the image, deleted afterwards.
-- Every VM run has an outer 300 s deadline, after which its processes are
-  killed in the VM and the run is scored as hung.
-- A failure with no failing test is labelled as such.
+- Every VM run has an outer deadline (its test timeouts plus 120 s). Past it,
+  the run's processes are killed in the VM and the run is scored as hung,
+  but only if a check afterwards finds no survivor and no leftover image.
+  Otherwise it is a harness error.
+- The unmutated suite runs first, and nothing is scored if it fails. A
+  non-zero exit with no failing test and no hang is a harness error, not a
+  catch, so an unreachable VM or a wrong `VM_DSN` can no longer print a
+  perfect score. Both were tried, and both stop at the baseline.
 - `make vm-mutate-queue` runs the queue mutants inside the VM. From macOS the
   host's port 5432 was another PostgreSQL, and a tunnel to the VM's database
   failed `TestSubmitClaimReport`'s lease tolerance on clock skew alone
