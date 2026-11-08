@@ -107,21 +107,24 @@ development VM.
 
 ## Numbers
 
-From `make bench` in CI on a GitHub-hosted `ubuntu-latest` runner (x86_64,
-`GOMAXPROCS` 2 as Go saw it, PostgreSQL 17 in a service container, the Alpine
-image), one run of twenty iterations. The source is the log of
-[PR #15](https://github.com/parth-sharma-10/forge/pull/15)'s `bench` step.
+These come from `make bench` in CI on GitHub-hosted `ubuntu-latest` runners
+(x86_64, `GOMAXPROCS` 2 as Go saw it, PostgreSQL 17 in a service container, the
+Alpine image). Each run is twenty iterations. The range covers the three runs
+on `main` on 2026-11-08, at commits 1bc2473, 3bd0dda and 9d36880 (Actions runs
+42458221829, 42458249205 and 42458768563, `bench` step).
 
-| Benchmark | What it measures | Result |
+| Benchmark | What it measures | Result (3 runs) |
 |---|---|---|
-| `BenchmarkRun` | one sandbox: namespaces, overlay, `/proc`, `/dev`, `pivot_root`, bounding set, seccomp, `exec /bin/true`, teardown | 5.9 ms |
-| `BenchmarkRunWithLimits` | the same with a cgroup per job | 5.8 ms |
-| `BenchmarkThroughput` | jobs per second through the queue and the sandbox, four loops, `/bin/true` | 10.1 ms per job, about 100 jobs/s |
+| `BenchmarkRun` | one sandbox: namespaces, overlay, `/proc`, `/dev`, `pivot_root`, bounding set, seccomp, `exec /bin/true`, teardown | 4.2–6.2 ms |
+| `BenchmarkRunWithLimits` | the same with a cgroup per job | 4.3–6.5 ms |
+| `BenchmarkThroughput` | jobs through the queue and the sandbox, four loops, `/bin/true` | 5.3–7.1 ms per job, about 140–190 jobs/s |
 
-These numbers come from one run on one shared runner. They are what the
-harness produced there, and nothing more. The development VM's numbers swung
-threefold between runs, because the VM was also hosting another project's
-Kubernetes cluster, so none are quoted from it.
+Shared runners are noisy. Across those three runs and the three on
+[PR #15](https://github.com/parth-sharma-10/forge/pull/15), one sandbox took
+3.7–6.2 ms and one job took 5.3–33.4 ms. Treat these figures as what the
+harness measured on those runs, not as a guarantee. None are quoted from the
+development VM, whose numbers swung threefold between runs because it was also
+hosting another project's Kubernetes cluster.
 [docs/failures.md](docs/failures.md) has that story.
 
 ## Security claims
