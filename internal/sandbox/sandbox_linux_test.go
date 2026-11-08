@@ -883,11 +883,13 @@ func TestInstalledFilterMatchesTheModel(t *testing.T) {
 		// The model's prediction, as an errno: the deny action carries ENOSYS
 		// in its low 16 bits, an allow means the syscall ran and getpid always
 		// succeeds (errno 0).
+		// Tagless, so that a mutation making denyAction equal retAllow still
+		// compiles (a tagged switch would have two identical cases).
 		var wantErrno int
-		switch got {
-		case denyAction:
+		switch {
+		case got == denyAction:
 			wantErrno = int(denyAction & 0xffff)
-		case retAllow:
+		case got == retAllow:
 			wantErrno = 0
 		default:
 			t.Fatalf("%s: model returned %#x, neither deny nor allow", name, got)

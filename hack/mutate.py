@@ -8,6 +8,7 @@ mutation is a test that proves nothing, and the harness exits non-zero on it.
 
     make mutate                       # every sandbox mutation, in the VM
     make mutate-queue                 # the queue's, on the host, against FORGE_TEST_DSN
+    make vm-mutate-queue              # the queue's, inside the VM, against its PostgreSQL
     hack/mutate.py identity-map       # just the ones named
 
 Three traps this harness guards against, each of which has cost a session
@@ -20,11 +21,15 @@ Three traps this harness guards against, each of which has cost a session
   * a mutation can hang instead of fail (one deadlocks Go's fork path before
     any assertion runs), so the test binary gets a deadline, and a hang is
     read from stderr -- the panic goes there while `--- FAIL` goes to stdout.
+    A thread stuck in the kernel can outlive that deadline (2026-11-08: two
+    hours in clone3), so each VM run also has an outer one, after which the
+    test process is killed in the VM and the run is scored as hung.
 """
 
 import os
 import pathlib
 import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -37,7 +42,11 @@ SECCOMP_ARM64 = "internal/sandbox/seccomp_linux_arm64.go"
 QUEUE = "internal/queue/queue.go"
 BINDIR = pathlib.Path.home() / ".cache/forge/mut"
 ROOTFS = os.environ.get("FORGE_TEST_ROOTFS", "/var/tmp/forge-rootfs")
-VM = os.environ.get("VM", "colima")
+VM = shlex.split(os.environ.get("VM", "colima"))  # e.g. "colima -p forge-cve"
+VM_DSN = os.environ.get("VM_DSN", "postgres://forge:forge@127.0.0.1:5432/forge")
+VM_DEADLINE = 300  # seconds; well past the test binaries' own -test.timeout
+HUNG = "harness: killed after the outer deadline"
+NO_COPY = "harness: could not copy the image"
 GOARCH = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "amd64"}[platform.machine()]
 BATCH = uuid.uuid4().hex[:8]
 
@@ -196,7 +205,8 @@ MUTATIONS = [
     (
         "no-overlay-image-bound-directly",
         SANDBOX,
-        "\tif err := mountOverlay(rootfs); err != nil {\n\t\treturn err\n\t}\n",
+        "\tif err := mountOverlay(rootfs, scratchBytes); err != nil {\n\t\treturn err\n\t}\n",
+        '\t_ = scratchBytes\n'
         '\tif err := syscall.Mount(rootfs, rootfs, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {\n'
         '\t\treturn fmt.Errorf("sandbox: bind rootfs %s: %w", rootfs, err)\n\t}\n',
     ),
@@ -205,10 +215,10 @@ MUTATIONS = [
     (
         "lower-is-cwd-not-image",
         SANDBOX,
+        'func mountOverlay(rootfs string, scratchBytes int64) error {\n'
         '\tif err := syscall.Chdir(rootfs); err != nil {\n'
-        '\t\treturn fmt.Errorf("sandbox: chdir %s: %w", rootfs, err)\n\t}\n'
-        '\tif err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, "mode=0755"); err != nil {',
-        '\tif err := syscall.Mount("tmpfs", rootfs, "tmpfs", 0, "mode=0755"); err != nil {',
+        '\t\treturn fmt.Errorf("sandbox: chdir %s: %w", rootfs, err)\n\t}\n',
+        'func mountOverlay(rootfs string, scratchBytes int64) error {\n',
     ),
     # Not scored: dropping ",userxattr". On Ubuntu's 6.8 the mount sets its
     # trusted.* xattrs from inside the user namespace without complaint, so no
@@ -350,13 +360,66 @@ def run_on_host(binary):
     )
 
 
+def vm_run(script, stem):
+    """Run script in the VM on a private copy of the image, removed afterwards.
+
+    A mutant that disables the overlay lets every build write into the image it
+    runs on; on the shared image that damage would fail the next mutant's
+    tests and score it caught, as it did on 2026-11-08. Past VM_DEADLINE
+    this mutation's test processes are killed.
+    """
+    image = f"{ROOTFS}-mut-{stem}"
+    wrapped = (
+        f"sudo cp -a {ROOTFS} {image} || {{ echo '{NO_COPY}' >&2; exit 125; }}; "
+        f"( {script.replace('{ROOTFS}', image)} ); rc=$?; sudo rm -rf {image}; exit $rc"
+    )
+    cmd = [*VM, "ssh", "--", "sh", "-c", wrapped]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=VM_DEADLINE)
+    except subprocess.TimeoutExpired as e:
+        subprocess.run([*VM, "ssh", "--", "sh", "-c",
+                        # [f] keeps the pattern from matching this shell's own command line.
+                        f"sudo pkill -9 -f '/tmp/[f]orge-mut-{stem}'; sleep 1; sudo rm -rf {image}"],
+                       capture_output=True, text=True)
+        out = e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or "")
+        return subprocess.CompletedProcess(cmd, 124, out, err + "\n" + HUNG)
+
+
 def run_in_vm(binary):
     script = (
         f"cp {binary} /tmp/forge-mut-{binary.stem}.test && "
-        f"sudo FORGE_TEST_ROOTFS={ROOTFS} /tmp/forge-mut-{binary.stem}.test "
+        f"sudo FORGE_TEST_ROOTFS={{ROOTFS}} /tmp/forge-mut-{binary.stem}.test "
         f"-test.count=1 -test.timeout=180s"
     )
-    return subprocess.run([VM, "ssh", "--", "sh", "-c", script], capture_output=True, text=True)
+    return vm_run(script, binary.stem)
+
+
+def worker_binary(binary):
+    return binary.with_name(binary.stem + "-worker.test")
+
+
+def build_queue_vm(binary):
+    # The queue's tests and the worker's, both built against the mutated queue.
+    env = dict(os.environ, GOOS="linux", GOARCH=GOARCH)
+    for out, pkg in ((binary, "./internal/queue"), (worker_binary(binary), "./internal/worker")):
+        built = subprocess.run(["go", "test", "-c", "-o", str(out), pkg],
+                               cwd=FORGE, env=env, capture_output=True, text=True)
+        if built.returncode != 0:
+            return built
+    return built
+
+
+def run_queue_in_vm(binary):
+    # In the VM the tests and PostgreSQL share a clock; from macOS through a
+    # tunnel they do not, and the lease-length assertions fail on skew alone.
+    q, w = f"/tmp/forge-mut-{binary.stem}.test", f"/tmp/forge-mut-{binary.stem}-worker.test"
+    script = (
+        f"cp {binary} {q} && cp {worker_binary(binary)} {w} && "
+        f"FORGE_TEST_DSN={VM_DSN} {q} -test.count=1 -test.timeout=120s && "
+        f"sudo FORGE_TEST_ROOTFS={{ROOTFS}} FORGE_TEST_DSN={VM_DSN} {w} -test.count=1 -test.timeout=120s"
+    )
+    return vm_run(script, binary.stem)
 
 
 def failing_tests(output):
@@ -367,9 +430,10 @@ def failing_tests(output):
 
 def main():
     args = sys.argv[1:]
+    queue_vm = "--queue-vm" in args
     on_host = "--queue" in args
-    only = set(a for a in args if a != "--queue")
-    mutations = QUEUE_MUTATIONS if on_host else MUTATIONS
+    only = set(a for a in args if not a.startswith("--"))
+    mutations = QUEUE_MUTATIONS if (on_host or queue_vm) else MUTATIONS
     originals = {rel: (FORGE / rel).read_text() for _, rel, _, _ in mutations}
     BINDIR.mkdir(parents=True, exist_ok=True)
     results, harness_errors = [], []
@@ -384,17 +448,33 @@ def main():
             path.write_text(source.replace(old, new, 1))
             try:
                 binary = BINDIR / f"{BATCH}-{name}.test"
-                built = build_host(binary) if on_host else build(binary)
+                if queue_vm:
+                    built = build_queue_vm(binary)
+                else:
+                    built = build_host(binary) if on_host else build(binary)
                 if built.returncode != 0 or not binary.exists():
                     harness_errors.append(f"{name}: does not compile\n{built.stderr.strip()[:400]}")
                     continue
-                got = run_on_host(binary) if on_host else run_in_vm(binary)
+                if queue_vm:
+                    got = run_queue_in_vm(binary)
+                else:
+                    got = run_on_host(binary) if on_host else run_in_vm(binary)
             finally:
                 path.write_text(source)
             caught = got.returncode != 0
-            hung = "panic: test timed out" in got.stdout + got.stderr
+            output = got.stdout + got.stderr
+            if NO_COPY in output:
+                harness_errors.append(f"{name}: {NO_COPY} {ROOTFS}")
+                continue
+            hung = "panic: test timed out" in output or HUNG in output
             results.append((name, caught))
-            detail = failing_tests(got.stdout) or ("hung, no assertion reached" if hung else "suite passed")
+            if hung:
+                fallback = "hung, no assertion reached"
+            elif caught:
+                fallback = f"exited {got.returncode} with no failing test"
+            else:
+                fallback = "suite passed"
+            detail = failing_tests(got.stdout) or fallback
             print(f"{'CAUGHT' if caught else 'MISSED'} {name}: {detail}", flush=True)
     finally:
         for rel, text in originals.items():

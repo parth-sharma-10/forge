@@ -93,7 +93,8 @@ make test          # gofmt check, go vet, go test -race (any OS; queue tests nee
 make test-sandbox  # the isolation tests: Linux, root, unpacks a rootfs
 make vm-test       # the same, from a macOS host, inside a colima VM (VM='colima -p <profile>')
 make mutate        # break the sandbox 27 ways and check a test notices each
-make mutate-queue  # break the queue 8 ways, against FORGE_TEST_DSN
+make mutate-queue  # break the queue 8 ways, against FORGE_TEST_DSN (Linux host)
+make vm-mutate-queue # the same, inside the colima VM, against its PostgreSQL
 make fuzz          # fuzz the seccomp filter against its policy (Linux, no root)
 make test-syscalls # the eBPF syscall-count test (Linux, root)
 make bench         # sandbox setup latency and jobs per second (Linux, root)
@@ -152,8 +153,8 @@ hosting another project's Kubernetes cluster.
 [docs/threat-model.md](docs/threat-model.md) has the full table (20 boundaries)
 with the code for each. It also states what is *not* defended, the largest gap
 being a kernel exploit through an allowed syscall. `make mutate` and
-`make mutate-queue` apply 27 sandbox and 8 queue mutations, each of which a
-test must catch.
+`make vm-mutate-queue` apply 27 sandbox and 8 queue mutations, each of which a
+test must catch; each runs on its own copy of the image.
 
 ## Limitations
 
