@@ -91,9 +91,9 @@ Killed
 
 - **User namespace.** Root inside the sandbox is uid 524288 on the host.
 - **Bounding set.** `0x800004fb` is nine capabilities: chown, dac_override, fowner, fsetid, kill, setgid, setuid, net_bind_service and setfcap. `CAP_SYS_ADMIN`, `CAP_SYS_MODULE` and `CAP_SYS_BOOT` are not among them.
-- **PID 1.** PID 1 in the sandbox is Forge's artifact supervisor, which makes itself non-dumpable, so its `/proc/1/root` and `/proc/1/ns/*` cannot be opened (`EACCES`). Even if they could, PID 1 is in the sandbox's own PID and mount namespaces, so the path would lead back to the sandbox root.
+- **PID 1.** With artifact collection on (the default `-artifact-mb 16`), PID 1 in the sandbox is Forge's artifact supervisor, which makes itself non-dumpable, so its `/proc/1/root` cannot be opened (`EACCES`), and by the same check neither can `/proc/1/ns/*`. Even if they could, PID 1 is in the sandbox's own PID and mount namespaces, so the path would lead back to the sandbox root.
 - **`..`.** After `pivot_root`, `/..` is `/`. The listing is the Alpine image, not the VM.
-- **Seccomp.** `mount`, `unshare`, `init_module`/`finit_module` and `reboot` are not on the allowlist, so each returns `ENOSYS` ("Function not implemented"; `insmod`'s exit 38 is `ENOSYS`). The capability bounding set would refuse the first three as well.
+- **Seccomp.** `mount`, `unshare`, `init_module`/`finit_module` and `reboot` are not on the allowlist, so each returns `ENOSYS` ("Function not implemented"; `insmod`'s exit 38 is `ENOSYS`). Without seccomp, the bounding set would still refuse `mount` and `init_module`; `unshare -U` needs no capability, so only the filter stops it.
 - **`/dev`.** It holds six character devices and four symlinks. There is no `/dev/sda` or `/dev/vda` to open.
 - **Network.** The network namespace has only a loopback interface, and it is down.
 - **pids cgroup.** `-pids 64` makes `fork` fail with `EAGAIN` long before 200 processes.

@@ -96,9 +96,9 @@ asserts the timing, and fails against the old implementation.
 **2026-11-06 — `internal/pool` removed.** This entry and the previous one are
 about the pool, which nothing used once the worker became N loops
 (decisions.md, 2026-09-16) and which was deleted after Phase 5 found no use for
-it. Both entries stand as written. The code they cite (`pool.go:129` is a line number in the
-pre-fix revision) and the tests `TestConcurrentSubmitAndClose` and `TestCloseReleasesParkedSubmit`, are
-in history: `git show f8ac9fc:internal/pool/pool.go`.
+it. Both entries stand as written. The code they cite and the tests `TestConcurrentSubmitAndClose` and
+`TestCloseReleasesParkedSubmit` are in history, where `pool.go:129` is a line
+number in the pre-fix revision: `git show f8ac9fc:internal/pool/pool.go`.
 
 ---
 

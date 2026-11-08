@@ -1,17 +1,19 @@
 # Forge
 
-Forge runs untrusted build commands for you. You submit a job over an HTTP API or
-the built-in web console, a worker claims it from a PostgreSQL queue, and the
-command runs in a Linux sandbox that Forge builds itself from namespaces,
-cgroups v2, `pivot_root`, a capability bounding set and a seccomp allowlist. It
-does not use Docker, runc or a container library.
+Forge runs untrusted build commands. A job submitted over an HTTP API (or the
+built-in web console) is scheduled onto a worker and runs inside a Linux
+sandbox, and a worker that dies mid-job does not lose it. Forge builds the
+sandbox itself from namespaces, cgroups v2, `pivot_root`, a capability
+bounding set and a seccomp allowlist. It does not use Docker, runc or a
+container library.
 
 ![Architecture: a client calls forge-api, which writes jobs to PostgreSQL; forge-worker processes claim them and run each one in its own sandbox](docs/architecture.svg)
 
-It is written in Go, with two direct dependencies (`pgx/v5` and `cilium/ebpf`).
-It is a learning project taken to a finished state, not a production service.
-Every claim below links to the test that proves it, and
-[Limitations](#limitations) says what Forge does not defend against.
+It is written in Go, with two runtime dependencies (`pgx/v5` and `cilium/ebpf`).
+It is a learning project, complete through its five planned phases, and not a
+production service. The [security claims](#security-claims) table names the
+test behind each boundary, and [Limitations](#limitations) says what Forge
+does not defend against.
 
 ## Demo
 
@@ -43,12 +45,13 @@ why each attempt fails.
   given up after `-max-attempts`.
 - **Worker** (`cmd/forge-worker`). It runs N claim loops, streams each job's
   output into its row while it runs, collects the files a build leaves in
-  `/out` as a capped tar, and handles cancel, timeout and drain on `Ctrl-C`.
+  `/out` as a capped tar, and handles cancel and timeout. The first `Ctrl-C`
+  drains; a second kills the jobs in hand.
 - **API** (`cmd/forge-api`). It submits, lists, follows logs, cancels and
   downloads artifacts. Every data route needs a bearer token, compared in
   constant time.
 - **Console** (`/ui/`). Three static files are embedded in `forge-api`. They
-  are the only thing served without the token, and they hold no job data. The
+  (and the redirect from `/` to them) are the only thing served without the token, and they hold no job data. The
   console renders everything as text, is served with a strict CSP, and keeps
   the token in `sessionStorage`, never in a cookie or URL.
 - **Operations.** Prometheus metrics come from both binaries, and optional
@@ -92,6 +95,7 @@ make vm-test       # the same, from a macOS host, inside a colima VM (VM='colima
 make mutate        # break the sandbox 27 ways and check a test notices each
 make mutate-queue  # break the queue 8 ways, against FORGE_TEST_DSN
 make fuzz          # fuzz the seccomp filter against its policy (Linux, no root)
+make test-syscalls # the eBPF syscall-count test (Linux, root)
 make bench         # sandbox setup latency and jobs per second (Linux, root)
 ```
 
@@ -135,7 +139,7 @@ hosting another project's Kubernetes cluster.
 | reach the host filesystem | mount namespace, bind + `pivot_root` + detach | `TestHostFilesystemIsUnreachable` |
 | change the shared image | per-job overlay on a tmpfs | `TestTheImageIsNeverWritten` |
 | reach the network | network namespace with no interfaces but loopback | `TestNetworkNamespaceHasNoHostInterfaces` |
-| call `mount`, `ptrace`, `bpf`, `init_module`, `unshare`… | seccomp allowlist | `TestFilterDeniesTheKernelFacingSurface`, `FuzzFilterMatchesPolicy` |
+| call `mount`, `ptrace`, `init_module`, `unshare`… | seccomp allowlist | `TestFilterDeniesTheKernelFacingSurface`, `FuzzFilterMatchesPolicy` |
 | create namespaces of its own | `clone` filtered on `CLONE_NEW*`; `clone3` denied | `TestABuildCannotCreateANamespace` |
 | keep `CAP_SYS_ADMIN` | bounding set cut to nine | `TestTheBoundingSetIsTheKeepList` |
 | open a host disk or `/dev/mem` | private `/dev`: six nodes, checked by major:minor | `TestDevIsOnlyTheMinimalSet` |
@@ -147,8 +151,9 @@ hosting another project's Kubernetes cluster.
 
 [docs/threat-model.md](docs/threat-model.md) has the full table (20 boundaries)
 with the code for each. It also states what is *not* defended, the largest gap
-being a kernel exploit through an allowed syscall. `make mutate` removes each
-property in turn and checks that a test fails.
+being a kernel exploit through an allowed syscall. `make mutate` and
+`make mutate-queue` apply 27 sandbox and 8 queue mutations, each of which a
+test must catch.
 
 ## Limitations
 
@@ -207,8 +212,9 @@ against at all, the largest being a kernel exploit through an allowed syscall.
 
 ## Requirements
 
-Go 1.27+, PostgreSQL for the queue, and two direct third-party dependencies: `pgx/v5`,
-its driver, and `cilium/ebpf`, for the optional syscall metrics.
+Go 1.27+, PostgreSQL for the queue, and two third-party runtime dependencies: `pgx/v5`,
+its driver, and `cilium/ebpf`, for the optional syscall metrics. (`golang.org/x/sys`
+is required only by a test.)
 
 The sandbox needs `CAP_SYS_ADMIN` and a Linux kernel with cgroups v2 and
 `CLONE_INTO_CGROUP` — 5.7 or newer. It re-executes itself after dropping to the
@@ -248,5 +254,8 @@ docs/              walkthrough, architecture, threat model, decisions, failures
 - [docs/threat-model.md](docs/threat-model.md): every boundary, its code and its test, and what is not defended
 - [docs/deployment.md](docs/deployment.md): systemd units, cgroup delegation, database, metrics
 - [docs/artifacts.md](docs/artifacts.md): how `/out` is collected safely
+- [docs/seccomp-fuzzer.md](docs/seccomp-fuzzer.md), [docs/observability-ebpf.md](docs/observability-ebpf.md): the filter's fuzzer, and per-job syscall counts
+- [docs/cve-2024-21626.md](docs/cve-2024-21626.md): the runc fd-leak CVE and where Forge stands against it
+- [docs/gpu-forge-v3.md](docs/gpu-forge-v3.md): GPU passthrough, scoped and not built
 - [docs/decisions.md](docs/decisions.md) and [docs/failures.md](docs/failures.md): why it is built this way, and what went wrong on the way
 - [docs/roadmap.md](docs/roadmap.md) and `docs/phase-0.md` to `docs/phase-5.md`: what "done" meant for each phase
