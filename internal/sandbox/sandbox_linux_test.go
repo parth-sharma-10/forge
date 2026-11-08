@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1259,6 +1260,21 @@ func TestPreflightPassesOnAWorkingHost(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("preflight on the test image: %v", err)
+	}
+}
+
+// TestPreflightBuildsTheArtifactSupervisor: with artifacts on, a job's child
+// limits itself as the supervisor (limitSupervisor) before the seccomp filter;
+// preflight has to take that path too, and then return rather than wait for an
+// archive the child never writes.
+func TestPreflightBuildsTheArtifactSupervisor(t *testing.T) {
+	err := Preflight(context.Background(), Spec{
+		Rootfs: rootfs(t), CgroupRoot: testCgroupRoot(t),
+		Limits:    cgroup.Limits{MemoryBytes: 64 << 20},
+		Artifacts: io.Discard, ArtifactBytes: 1 << 20,
+	})
+	if err != nil {
+		t.Fatalf("preflight with artifacts on the test image: %v", err)
 	}
 }
 

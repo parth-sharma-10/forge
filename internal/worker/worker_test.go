@@ -5,11 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/parth-sharma-10/forge/internal/cgroup"
 	"github.com/parth-sharma-10/forge/internal/metrics"
 	"github.com/parth-sharma-10/forge/internal/queue"
 	"github.com/parth-sharma-10/forge/internal/sandbox"
@@ -411,6 +413,44 @@ func TestArtifactsAreReportedOnlyForABuildThatExited(t *testing.T) {
 				t.Errorf("reported artifact %q, want %q (exit %d)", r.Artifact, tc.want, r.ExitCode)
 			}
 		})
+	}
+}
+
+// TestPreflightBuildsTheSandboxAJobGets: the startup check is worth something
+// only if it builds the sandbox a job will get. A field a job's spec carries
+// and preflight's does not is a path every job takes that preflight never
+// tried — artifacts put the build under a supervisor that drops capabilities
+// of its own (limitSupervisor), and it is on by default.
+func TestPreflightBuildsTheSandboxAJobGets(t *testing.T) {
+	for _, artifactBytes := range []int64{-1, 0, 16 << 20} {
+		store := newStore([]string{"make"})
+		var job sandbox.Spec
+		w := &Worker{Store: store, Rootfs: "/img", CgroupRoot: "/sys/fs/cgroup/forge",
+			Limits:       cgroup.Limits{MemoryBytes: 64 << 20, CPUCores: 1, MaxPIDs: 64},
+			ScratchBytes: 8 << 20, ArtifactBytes: artifactBytes,
+			Lease: time.Second, Poll: 10 * time.Millisecond,
+			Run: func(_ context.Context, spec sandbox.Spec) error {
+				job = spec
+				return nil
+			}}
+		serve(t, w)
+		store.waitReport(t)
+		pre := w.preflightSpec()
+
+		if (job.Artifacts == nil) != (pre.Artifacts == nil) {
+			t.Errorf("ArtifactBytes=%d: a job collects artifacts=%t, preflight=%t",
+				artifactBytes, job.Artifacts != nil, pre.Artifacts != nil)
+		}
+		// What is the job's own and not the worker's: its command, its
+		// stdio, where its archive goes. Observe is dropped by Preflight.
+		for _, s := range []*sandbox.Spec{&job, &pre} {
+			s.Args, s.Stdin, s.Stdout, s.Stderr = nil, nil, nil, nil
+			s.Artifacts, s.Observe = nil, nil
+		}
+		if !reflect.DeepEqual(job, pre) {
+			t.Errorf("ArtifactBytes=%d: preflight builds\n%+v\na job gets\n%+v",
+				artifactBytes, pre, job)
+		}
 	}
 }
 
