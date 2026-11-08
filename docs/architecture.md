@@ -2,7 +2,7 @@
 
 Status: **all five phases complete** — see [phase-0.md](phase-0.md)
 through [phase-5.md](phase-5.md) for what each means and how it is
-checked, and [deployment.md](deployment.md) for running it. The bounded worker pool, the sandbox's namespace
+checked, and [deployment.md](deployment.md) for running it. The sandbox's namespace
 isolation with a private device filesystem, per-job cgroups v2 resource limits,
 a deny-by-default seccomp filter, the user namespace and, from Phase 1, a
 per-job overlay root filesystem exist. This document
@@ -97,33 +97,6 @@ library. The API's `/metrics` samples the queue's depth by state on every
 scrape; the worker's `-metrics` listener reports claims, outcomes, lost
 leases and jobs in hand. A sample that fails — the database down — is
 absent with a comment, and the rest of the scrape is intact.
-
-### internal/pool — bounded worker pool
-
-`Pool` runs `Task`s on a fixed set of goroutines. It was built as the
-concurrency primitive for the worker's job loop, and the loop, when it came
-in Phase 2, did not use it — see decisions.md, 2026-09-16. Its shutdown
-semantics are still the point of the package, not the fan-out, and they are
-the same two stops the worker has.
-
-Two distinct shutdown modes:
-
-| Mode | Trigger | Effect |
-|---|---|---|
-| Drain (graceful) | `Close()` | Stop accepting; queued and running tasks finish. |
-| Cancel (hard) | root `ctx` cancelled | Workers stop; running tasks see `ctx.Done()`. |
-
-The one subtle part is that `Close` closes the task channel while `Submit` may
-be parked on a send to it — a "send on closed channel" panic waiting to happen.
-`Submit` therefore registers itself in a `sync.WaitGroup` under a read lock
-before sending; `Close` flips the closed flag under the write lock, waits for
-every registered sender to leave, and only then closes the channel. A sender
-parked on a full queue is never stuck, because its `select` also watches the
-caller's context and the pool's root context.
-
-Worker loop re-checks `ctx.Err()` after receiving a task: `select` picks
-randomly among ready cases, so a cancelled pool with a non-empty queue would
-otherwise keep starting new work.
 
 ### internal/sandbox — namespace isolation and pivot_root
 

@@ -285,7 +285,6 @@ internal/metrics   Prometheus text format         implemented
 deploy/            systemd units                  verified in CI
 cmd/forged         sandbox runtime               implemented
 internal/worker    claim, run, heartbeat, report implemented
-internal/pool      bounded worker pool           implemented, unused by the worker
 internal/sandbox   namespaces, pivot_root, /dev  implemented
                    seccomp allowlist             implemented
                    user namespace and id map     implemented
